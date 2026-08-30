@@ -17,7 +17,7 @@ namespace WarcraftAutoBalance;
 public class WarcraftAutoBalancePlugin : BasePlugin
 {
     public override string ModuleName => "Warcraft Auto Balance";
-    public override string ModuleVersion => "2.7.0";
+    public override string ModuleVersion => "2.8.0";
     public override string ModuleAuthor => "YourName";
     public override string ModuleDescription =>
         "Persistent, self-learning team balancing for Warcraft CS2.";
@@ -69,6 +69,15 @@ public class WarcraftAutoBalancePlugin : BasePlugin
     private const int EmergencyTeamCountDifference = 2;
 
     private bool _disconnectRebalancePending;
+
+    // Initial live-round balance state.
+    //
+    // The balance is NEVER applied while players are actively fighting
+    // in warmup. We wait for the first non-warmup round_prestart, which
+    // CS2 emits before the rest of the round-restart actions.
+    private bool _initialLiveBalanceCompleted;
+    private bool _warmupEndedObserved;
+    private bool _gameRulesWarningLogged;
 
     // ============================================================
     // PLAYER RATING WEIGHTS
@@ -146,8 +155,15 @@ public class WarcraftAutoBalancePlugin : BasePlugin
     {
         LoadPersistentData();
 
+        RegisterEventHandler<EventWarmupEnd>(OnWarmupEnd);
+        RegisterEventHandler<EventRoundPrestart>(
+            OnRoundPrestart,
+            HookMode.Pre);
+
         RegisterEventHandler<EventRoundStart>(OnRoundStart);
         RegisterEventHandler<EventRoundEnd>(OnRoundEnd);
+
+        RegisterListener<Listeners.OnMapStart>(OnMapStart);
 
         RegisterEventHandler<EventPlayerHurt>(OnPlayerHurt);
         RegisterEventHandler<EventPlayerDeath>(OnPlayerDeath);
@@ -155,6 +171,25 @@ public class WarcraftAutoBalancePlugin : BasePlugin
 
         RegisterEventHandler<EventBombPlanted>(OnBombPlanted);
         RegisterEventHandler<EventBombDefused>(OnBombDefused);
+
+        // A hot reload in the middle of a live match must NOT suddenly
+        // perform a fresh "Round 1" rebalance. If game rules clearly
+        // report warmup, leave the initial balance available; otherwise
+        // fail safe and treat it as already completed.
+        if (hotReload)
+        {
+            if (TryGetGameRules(out CCSGameRules? rules) &&
+                rules != null &&
+                rules.WarmupPeriod)
+            {
+                _initialLiveBalanceCompleted = false;
+                _warmupEndedObserved = false;
+            }
+            else
+            {
+                _initialLiveBalanceCompleted = true;
+            }
+        }
 
         Logger.LogInformation(
             "[WarcraftBalance] Loaded with {Players} player ratings and {Races} race profiles.",
@@ -388,6 +423,826 @@ public class WarcraftAutoBalancePlugin : BasePlugin
                 EvaluateEmergencyPopulationBalance();
             }
         );
+    }
+
+    // ============================================================
+    // MAP / WARMUP / INITIAL LIVE BALANCE
+    // ============================================================
+
+    private void OnMapStart(string mapName)
+    {
+        _initialLiveBalanceCompleted = false;
+        _warmupEndedObserved = false;
+        _gameRulesWarningLogged = false;
+
+        Logger.LogInformation(
+            "[WarcraftBalance] Map {Map} started. Initial live balance armed.",
+            mapName);
+    }
+
+    private HookResult OnWarmupEnd(
+        EventWarmupEnd @event,
+        GameEventInfo info)
+    {
+        _warmupEndedObserved = true;
+
+        Logger.LogInformation(
+            "[WarcraftBalance] Warmup ended. Initial balance will apply at the next live round_prestart.");
+
+        return HookResult.Continue;
+    }
+
+    private HookResult OnRoundPrestart(
+        EventRoundPrestart @event,
+        GameEventInfo info)
+    {
+        if (_initialLiveBalanceCompleted)
+            return HookResult.Continue;
+
+        // round_prestart also fires during warmup. The GameRules proxy
+        // is the authoritative guard. If it is temporarily unavailable,
+        // only proceed if we have positively observed warmup_end.
+        if (TryGetGameRules(out CCSGameRules? rules) &&
+            rules != null)
+        {
+            if (rules.WarmupPeriod)
+                return HookResult.Continue;
+        }
+        else if (!_warmupEndedObserved)
+        {
+            if (!_gameRulesWarningLogged)
+            {
+                _gameRulesWarningLogged = true;
+
+                Logger.LogWarning(
+                    "[WarcraftBalance] GameRules unavailable during round_prestart; delaying initial balance rather than risking a warmup/live-state mistake.");
+            }
+
+            return HookResult.Continue;
+        }
+
+        // Set the guard BEFORE moving anyone. If a team-change side
+        // effect causes another event path, the initial pass cannot run
+        // twice.
+        _initialLiveBalanceCompleted = true;
+
+        ApplyInitialLiveBalance();
+
+        return HookResult.Continue;
+    }
+
+    private static bool TryGetGameRules(
+        out CCSGameRules? rules)
+    {
+        rules = null;
+
+        try
+        {
+            CCSGameRulesProxy? proxy =
+                Utilities
+                    .FindAllEntitiesByDesignerName<CCSGameRulesProxy>(
+                        "cs_gamerules")
+                    .FirstOrDefault();
+
+            if (proxy == null ||
+                !proxy.IsValid ||
+                proxy.GameRules == null)
+            {
+                return false;
+            }
+
+            rules = proxy.GameRules;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // ============================================================
+    // INITIAL LIVE-ROUND BALANCE
+    // ============================================================
+
+    private void ApplyInitialLiveBalance()
+    {
+        List<CCSPlayerController> humans =
+            GetActivePlayers();
+
+        if (humans.Count < 2)
+        {
+            Logger.LogInformation(
+                "[WarcraftBalance] Initial live balance skipped: only {Humans} human(s) available.",
+                humans.Count);
+
+            return;
+        }
+
+        // The current list and race assignments are read HERE, at the
+        // first live round_prestart. Players/races that changed during
+        // warmup therefore use the latest available state.
+        if (humans.Count <=
+            LowPopulationHumanThreshold)
+        {
+            ApplyInitialLowPopulationBalance(humans);
+            return;
+        }
+
+        InitialTeamPartition? best =
+            FindBestInitialTeamPartition(humans);
+
+        if (best == null)
+        {
+            Logger.LogWarning(
+                "[WarcraftBalance] Initial live balance could not produce a valid high-pop partition.");
+
+            return;
+        }
+
+        int humanMoves = 0;
+
+        foreach (CCSPlayerController player in humans)
+        {
+            CsTeam desiredTeam =
+                best.TerroristSteamIds.Contains(
+                    player.SteamID)
+                    ? CsTeam.Terrorist
+                    : CsTeam.CounterTerrorist;
+
+            if (player.Team == desiredTeam)
+                continue;
+
+            player.SwitchTeam(desiredTeam);
+            humanMoves++;
+        }
+
+        int terroristHumans =
+            best.TerroristSteamIds.Count;
+
+        int counterTerroristHumans =
+            humans.Count -
+            terroristHumans;
+
+        int botMoves =
+            RedistributeBotsForEvenTeams(
+                terroristHumans,
+                counterTerroristHumans);
+
+        Server.PrintToChatAll(
+            $" \x04[Balance]\x01 Initial teams set for Round 1 " +
+            $"({best.ExpectedCTWinChance:P0} projected CT win chance)."
+        );
+
+        Logger.LogInformation(
+            "[WarcraftBalance] Initial high-pop balance applied before live Round 1 restart actions. " +
+            "T humans {TCount}, CT humans {CTCount}, T rating {TRating:F0}, CT rating {CTRating:F0}, " +
+            "CT expected {CTChance:P1}, human moves {HumanMoves}, bot moves {BotMoves}.",
+            terroristHumans,
+            counterTerroristHumans,
+            best.TerroristRating,
+            best.CounterTerroristRating,
+            best.ExpectedCTWinChance,
+            humanMoves,
+            botMoves
+        );
+
+        SavePersistentData();
+    }
+
+    private void ApplyInitialLowPopulationBalance(
+        List<CCSPlayerController> humans)
+    {
+        LowPopulationPartition? best =
+            FindBestLowPopulationPartition(humans);
+
+        if (best == null)
+            return;
+
+        int humanMoves = 0;
+
+        foreach (CCSPlayerController player in humans)
+        {
+            CsTeam desiredTeam =
+                best.TerroristSteamIds.Contains(
+                    player.SteamID)
+                    ? CsTeam.Terrorist
+                    : CsTeam.CounterTerrorist;
+
+            if (player.Team == desiredTeam)
+                continue;
+
+            player.SwitchTeam(desiredTeam);
+            humanMoves++;
+        }
+
+        int terroristHumans =
+            best.TerroristSteamIds.Count;
+
+        int counterTerroristHumans =
+            humans.Count -
+            terroristHumans;
+
+        int botMoves =
+            RedistributeBotsForEvenTeams(
+                terroristHumans,
+                counterTerroristHumans);
+
+        Server.PrintToChatAll(
+            $" \x04[Balance]\x01 Initial low-pop teams set for Round 1."
+        );
+
+        Logger.LogInformation(
+            "[WarcraftBalance] Initial low-pop balance applied before live Round 1 restart actions. " +
+            "T human power {TPower:F2}, CT human power {CTPower:F2}, " +
+            "human moves {HumanMoves}, bot moves {BotMoves}.",
+            best.TerroristPower,
+            best.CounterTerroristPower,
+            humanMoves,
+            botMoves
+        );
+
+        SavePersistentData();
+    }
+
+    private InitialTeamPartition? FindBestInitialTeamPartition(
+        List<CCSPlayerController> humans)
+    {
+        if (humans.Count < 2)
+            return null;
+
+        Dictionary<ulong, double> ratings =
+            humans.ToDictionary(
+                p => p.SteamID,
+                CalculatePlayerRating);
+
+        int floorCount =
+            humans.Count / 2;
+
+        int ceilingCount =
+            humans.Count -
+            floorCount;
+
+        List<int> targetTCounts =
+            floorCount == ceilingCount
+                ? new List<int> { floorCount }
+                : new List<int>
+                {
+                    floorCount,
+                    ceilingCount
+                };
+
+        InitialTeamPartition? best = null;
+
+        foreach (int targetTCount
+                 in targetTCounts)
+        {
+            double totalRating =
+                humans.Sum(
+                    p => ratings[p.SteamID]);
+
+            int targetCTCount =
+                humans.Count -
+                targetTCount;
+
+            // Solve for the T rating sum that makes the two effective
+            // average ratings equal after the same modest human-count
+            // adjustment used by pre-round expectation.
+            //
+            // tAvg =
+            // ctAvg + (ctCount - tCount) * adjustment
+            double targetTRatingSum =
+                (
+                    targetTCount *
+                    totalRating
+                    +
+                    targetTCount *
+                    targetCTCount *
+                    (targetCTCount - targetTCount) *
+                    PlayerCountExpectationAdjustment
+                )
+                /
+                humans.Count;
+
+            HashSet<ulong> tIds =
+                FindClosestRatingSubset(
+                    humans,
+                    ratings,
+                    targetTCount,
+                    targetTRatingSum);
+
+            if (tIds.Count != targetTCount)
+                continue;
+
+            InitialTeamPartition candidate =
+                CreateInitialTeamPartition(
+                    humans,
+                    ratings,
+                    tIds);
+
+            // For equal-size teams, the complement has identical
+            // strength distance but may require far fewer SwitchTeam()
+            // operations. Evaluate it explicitly.
+            if (targetTCount ==
+                targetCTCount)
+            {
+                HashSet<ulong> complement =
+                    humans
+                        .Where(
+                            p => !tIds.Contains(
+                                p.SteamID))
+                        .Select(
+                            p => p.SteamID)
+                        .ToHashSet();
+
+                InitialTeamPartition inverse =
+                    CreateInitialTeamPartition(
+                        humans,
+                        ratings,
+                        complement);
+
+                if (IsBetterInitialPartition(
+                        inverse,
+                        candidate))
+                {
+                    candidate = inverse;
+                }
+            }
+
+            if (best == null ||
+                IsBetterInitialPartition(
+                    candidate,
+                    best))
+            {
+                best = candidate;
+            }
+        }
+
+        return best;
+    }
+
+    private InitialTeamPartition CreateInitialTeamPartition(
+        List<CCSPlayerController> humans,
+        Dictionary<ulong, double> ratings,
+        HashSet<ulong> terroristIds)
+    {
+        List<CCSPlayerController> terrorists =
+            humans
+                .Where(
+                    p => terroristIds.Contains(
+                        p.SteamID))
+                .ToList();
+
+        List<CCSPlayerController> counterTerrorists =
+            humans
+                .Where(
+                    p => !terroristIds.Contains(
+                        p.SteamID))
+                .ToList();
+
+        double tRating =
+            terrorists.Average(
+                p => ratings[p.SteamID]);
+
+        double ctRating =
+            counterTerrorists.Average(
+                p => ratings[p.SteamID]);
+
+        int countDifference =
+            counterTerrorists.Count -
+            terrorists.Count;
+
+        double adjustedCTRating =
+            ctRating +
+            countDifference *
+            PlayerCountExpectationAdjustment;
+
+        double ctChance =
+            CalculateExpectedWinChance(
+                adjustedCTRating,
+                tRating);
+
+        int moves =
+            CountMovesForPartition(
+                humans,
+                terroristIds);
+
+        return new InitialTeamPartition
+        {
+            TerroristSteamIds =
+                terroristIds,
+
+            TerroristRating =
+                tRating,
+
+            CounterTerroristRating =
+                ctRating,
+
+            ExpectedCTWinChance =
+                ctChance,
+
+            Imbalance =
+                Math.Abs(
+                    ctChance -
+                    0.50),
+
+            HumanMoves =
+                moves
+        };
+    }
+
+    private static bool IsBetterInitialPartition(
+        InitialTeamPartition candidate,
+        InitialTeamPartition current)
+    {
+        if (candidate.Imbalance <
+            current.Imbalance - 0.000001)
+        {
+            return true;
+        }
+
+        if (Math.Abs(
+                candidate.Imbalance -
+                current.Imbalance) <
+            0.000001)
+        {
+            return candidate.HumanMoves <
+                current.HumanMoves;
+        }
+
+        return false;
+    }
+
+    private HashSet<ulong> FindClosestRatingSubset(
+        List<CCSPlayerController> humans,
+        Dictionary<ulong, double> ratings,
+        int targetCount,
+        double targetSum)
+    {
+        // Exact meet-in-the-middle search is cheap for normal CS2
+        // community-server populations. 32 humans means at most 65,536
+        // subsets per half, and this only runs once at match start.
+        if (humans.Count <= 32)
+        {
+            return FindClosestRatingSubsetExact(
+                humans,
+                ratings,
+                targetCount,
+                targetSum);
+        }
+
+        // Conservative fallback for unusually large servers.
+        return FindClosestRatingSubsetGreedy(
+            humans,
+            ratings,
+            targetCount,
+            targetSum);
+    }
+
+    private HashSet<ulong> FindClosestRatingSubsetExact(
+        List<CCSPlayerController> humans,
+        Dictionary<ulong, double> ratings,
+        int targetCount,
+        double targetSum)
+    {
+        int split =
+            humans.Count / 2;
+
+        List<CCSPlayerController> left =
+            humans
+                .Take(split)
+                .ToList();
+
+        List<CCSPlayerController> right =
+            humans
+                .Skip(split)
+                .ToList();
+
+        List<InitialSubset>[] rightByCount =
+            Enumerable
+                .Range(
+                    0,
+                    right.Count + 1)
+                .Select(
+                    _ => new List<InitialSubset>())
+                .ToArray();
+
+        int rightCombinations =
+            1 << right.Count;
+
+        for (int mask = 0;
+             mask < rightCombinations;
+             mask++)
+        {
+            int count = 0;
+            double sum = 0;
+
+            for (int i = 0;
+                 i < right.Count;
+                 i++)
+            {
+                if ((mask & (1 << i)) == 0)
+                    continue;
+
+                count++;
+                sum +=
+                    ratings[
+                        right[i].SteamID];
+            }
+
+            rightByCount[count].Add(
+                new InitialSubset
+                {
+                    Mask = mask,
+                    Sum = sum
+                });
+        }
+
+        foreach (List<InitialSubset> bucket
+                 in rightByCount)
+        {
+            bucket.Sort(
+                (a, b) =>
+                    a.Sum.CompareTo(b.Sum));
+        }
+
+        double bestDifference =
+            double.MaxValue;
+
+        int bestLeftMask = 0;
+        int bestRightMask = 0;
+        bool found = false;
+
+        int leftCombinations =
+            1 << left.Count;
+
+        for (int leftMask = 0;
+             leftMask < leftCombinations;
+             leftMask++)
+        {
+            int leftCount = 0;
+            double leftSum = 0;
+
+            for (int i = 0;
+                 i < left.Count;
+                 i++)
+            {
+                if ((leftMask &
+                     (1 << i)) == 0)
+                {
+                    continue;
+                }
+
+                leftCount++;
+                leftSum +=
+                    ratings[
+                        left[i].SteamID];
+            }
+
+            int rightNeeded =
+                targetCount -
+                leftCount;
+
+            if (rightNeeded < 0 ||
+                rightNeeded >
+                right.Count)
+            {
+                continue;
+            }
+
+            List<InitialSubset> bucket =
+                rightByCount[rightNeeded];
+
+            if (bucket.Count == 0)
+                continue;
+
+            double desiredRight =
+                targetSum -
+                leftSum;
+
+            int index =
+                LowerBoundInitialSubset(
+                    bucket,
+                    desiredRight);
+
+            int start =
+                Math.Max(
+                    0,
+                    index - 2);
+
+            int end =
+                Math.Min(
+                    bucket.Count - 1,
+                    index + 2);
+
+            for (int j = start;
+                 j <= end;
+                 j++)
+            {
+                double difference =
+                    Math.Abs(
+                        leftSum +
+                        bucket[j].Sum -
+                        targetSum);
+
+                if (difference <
+                    bestDifference)
+                {
+                    bestDifference =
+                        difference;
+
+                    bestLeftMask =
+                        leftMask;
+
+                    bestRightMask =
+                        bucket[j].Mask;
+
+                    found = true;
+                }
+            }
+        }
+
+        if (!found)
+            return new HashSet<ulong>();
+
+        HashSet<ulong> result =
+            new();
+
+        for (int i = 0;
+             i < left.Count;
+             i++)
+        {
+            if ((bestLeftMask &
+                 (1 << i)) != 0)
+            {
+                result.Add(
+                    left[i].SteamID);
+            }
+        }
+
+        for (int i = 0;
+             i < right.Count;
+             i++)
+        {
+            if ((bestRightMask &
+                 (1 << i)) != 0)
+            {
+                result.Add(
+                    right[i].SteamID);
+            }
+        }
+
+        return result;
+    }
+
+    private static int LowerBoundInitialSubset(
+        List<InitialSubset> sorted,
+        double target)
+    {
+        int low = 0;
+        int high =
+            sorted.Count;
+
+        while (low < high)
+        {
+            int mid =
+                low +
+                ((high - low) / 2);
+
+            if (sorted[mid].Sum <
+                target)
+            {
+                low =
+                    mid + 1;
+            }
+            else
+            {
+                high =
+                    mid;
+            }
+        }
+
+        return low;
+    }
+
+    private HashSet<ulong> FindClosestRatingSubsetGreedy(
+        List<CCSPlayerController> humans,
+        Dictionary<ulong, double> ratings,
+        int targetCount,
+        double targetSum)
+    {
+        List<CCSPlayerController> remaining =
+            humans
+                .OrderBy(
+                    p => ratings[p.SteamID])
+                .ToList();
+
+        HashSet<ulong> selected =
+            new();
+
+        double selectedSum = 0;
+
+        while (selected.Count <
+               targetCount &&
+               remaining.Count > 0)
+        {
+            int slotsRemaining =
+                targetCount -
+                selected.Count;
+
+            double desiredAverage =
+                (
+                    targetSum -
+                    selectedSum
+                )
+                /
+                slotsRemaining;
+
+            CCSPlayerController next =
+                remaining
+                    .OrderBy(
+                        p =>
+                            Math.Abs(
+                                ratings[p.SteamID] -
+                                desiredAverage))
+                    .First();
+
+            selected.Add(
+                next.SteamID);
+
+            selectedSum +=
+                ratings[next.SteamID];
+
+            remaining.Remove(next);
+        }
+
+        // Local pair-swap refinement for the fallback path.
+        bool improved = true;
+
+        while (improved)
+        {
+            improved = false;
+
+            double currentDifference =
+                Math.Abs(
+                    selected.Sum(
+                        id => ratings[id]) -
+                    targetSum);
+
+            ulong selectedToRemove = 0;
+            ulong unselectedToAdd = 0;
+            double bestDifference =
+                currentDifference;
+
+            foreach (ulong selectedId
+                     in selected)
+            {
+                foreach (CCSPlayerController other
+                         in humans.Where(
+                             p => !selected.Contains(
+                                 p.SteamID)))
+                {
+                    double proposedSum =
+                        selected.Sum(
+                            id => ratings[id])
+                        -
+                        ratings[selectedId]
+                        +
+                        ratings[other.SteamID];
+
+                    double difference =
+                        Math.Abs(
+                            proposedSum -
+                            targetSum);
+
+                    if (difference <
+                        bestDifference - 0.0001)
+                    {
+                        bestDifference =
+                            difference;
+
+                        selectedToRemove =
+                            selectedId;
+
+                        unselectedToAdd =
+                            other.SteamID;
+                    }
+                }
+            }
+
+            if (selectedToRemove != 0 &&
+                unselectedToAdd != 0)
+            {
+                selected.Remove(
+                    selectedToRemove);
+
+                selected.Add(
+                    unselectedToAdd);
+
+                improved = true;
+            }
+        }
+
+        return selected;
     }
 
     // ============================================================
@@ -2526,6 +3381,52 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         }
 
         public int HumanMoves {
+            get;
+            init;
+        }
+    }
+
+    private sealed class InitialTeamPartition
+    {
+        public HashSet<ulong> TerroristSteamIds {
+            get;
+            init;
+        } = new();
+
+        public double TerroristRating {
+            get;
+            init;
+        }
+
+        public double CounterTerroristRating {
+            get;
+            init;
+        }
+
+        public double ExpectedCTWinChance {
+            get;
+            init;
+        }
+
+        public double Imbalance {
+            get;
+            init;
+        }
+
+        public int HumanMoves {
+            get;
+            init;
+        }
+    }
+
+    private sealed class InitialSubset
+    {
+        public int Mask {
+            get;
+            init;
+        }
+
+        public double Sum {
             get;
             init;
         }
