@@ -1,8 +1,8 @@
-# WarcraftAutoBalance v2.7 — Full Server & Warcraft Mod Implementation Guide
+# WarcraftAutoBalance v2.8 — Full Server & Warcraft Mod Implementation Guide
 
 This guide covers the complete installation, integration, configuration, validation, and operational model for **WarcraftAutoBalance v2.7**.
 
-v2.7 is designed for a Warcraft-style Counter-Strike 2 server where:
+v2.8 is designed for a Warcraft-style Counter-Strike 2 server where:
 
 - races can dramatically change player power;
 - players may change races frequently;
@@ -765,6 +765,76 @@ or approximately:
 It does **not** stop at the first merely acceptable 55/45 candidate.
 
 ---
+
+
+# 18A. Initial Balance Before Live Round 1
+
+v2.8 adds a one-time initial balance so the match does not wait until Round 4
+before correcting the starting teams.
+
+The plugin observes:
+
+```text
+warmup_end
+        ↓
+first non-warmup round_prestart
+        ↓
+re-read CURRENT humans
+re-read CURRENT base race/level assignments
+        ↓
+calculate complete starting partition
+        ↓
+SwitchTeam() during round_prestart
+        ↓
+CS2 continues normal round restart actions
+        ↓
+players receive normal Round 1 team spawns
+```
+
+CS2's `round_prestart` event is emitted before the rest of the round restart
+actions. The plugin therefore does not change teams while players are already
+alive and fighting in warmup.
+
+The initial balance never uses:
+
+```text
+Respawn()
+manual kill/slay
+manual spawn teleport
+pawn replacement
+```
+
+That is important for this Warcraft server because those actions could trigger
+race resurrection, summon-form respawns, death hooks, cooldown resets, extra-life
+logic, or spawn abilities.
+
+The player/race list is recalculated at the live prestart rather than being frozen
+several seconds earlier during warmup. A race change, join, or disconnect before
+that point is therefore reflected in the starting partition.
+
+For 2–6 humans, the existing nonlinear low-pop model is used and can intentionally
+produce 1v2, 1v3, 1v4, or 1v5 human splits when the strength model supports it.
+
+For 7+ humans, the initial pass ignores the normal 58/42 disruption threshold.
+Its purpose is to build the closest starting matchup available. Up to 32 humans,
+an exact meet-in-the-middle fixed-cardinality subset search finds the team rating
+sum closest to the ideal target. For larger populations, a greedy selection plus
+local pair-swap refinement is used.
+
+Odd populations evaluate both possible team-size orientations, including the
+same modest player-count expectation adjustment so the extra real human is not
+treated as having zero value.
+
+Bots are redistributed only after the logical human partition is known.
+
+`round_prestart` also fires during warmup, so the plugin checks
+`CCSGameRulesProxy.GameRules.WarmupPeriod`. It also observes `warmup_end`.
+If GameRules is unavailable and warmup end has not been positively observed, the
+plugin delays the initial pass rather than risking a warmup team switch.
+
+On plugin hot reload during an already-live match, the initial balance is treated
+as completed unless GameRules clearly reports that warmup is still active. This
+prevents an unexpected mid-match "Round 1" rebalance.
 
 # 19. No Swap Protection
 
@@ -2150,4 +2220,4 @@ survival credit remains false
 race receives long-term outcome attribution
 ```
 
-That is the intended v2.7 implementation model.
+That is the intended v2.8 implementation model.
