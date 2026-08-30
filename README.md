@@ -1,143 +1,168 @@
-# WarcraftAutoBalance v2.4 — Full Server & Warcraft Mod Integration Guide
+# WarcraftAutoBalance v2.7 — Full Server & Warcraft Mod Implementation Guide
 
-This guide walks through installing, building, deploying, and integrating **WarcraftAutoBalance v2.4** with a CounterStrikeSharp-based Warcraft CS2 server.
+This guide covers the complete installation, integration, configuration, validation, and operational model for **WarcraftAutoBalance v2.7**.
 
-The intended architecture is:
+v2.7 is designed for a Warcraft-style Counter-Strike 2 server where:
 
-```text
-CS2 Dedicated Server
-└── CounterStrikeSharp
-    ├── Main Warcraft Mod
-    │   └── knows each player's race and race level
-    │
-    └── WarcraftAutoBalance
-        ├── tracks player performance
-        ├── learns persistent player ratings
-        ├── learns race strength
-        ├── balances every 4 rounds
-        ├── handles low-population balancing
-        └── immediately reacts to severe disconnect imbalance
-```
+- races can dramatically change player power;
+- players may change races frequently;
+- races may respawn players;
+- some races may temporarily respawn players as summons or alternate forms;
+- summons/projectiles may deal damage independently of the owning player controller;
+- bots may be present as population filler;
+- player population can change quickly;
+- low-population matches may intentionally use asymmetric human teams such as 1v2, 1v3, 1v4, or 1v5.
 
-The two plugins communicate through the CounterStrikeSharp **Shared Plugin API / PluginCapability** system.
+The balancer therefore does **not** treat normal CS2 K/D or physical team counts as the complete measure of team strength.
 
 ---
 
-# 1. Requirements
+# 1. What the Plugin Does
 
-Before installing this plugin, the server should already have:
+WarcraftAutoBalance maintains a persistent hidden balance rating for each human player and combines it with current Warcraft race information.
 
-- A working Counter-Strike 2 dedicated server.
-- Metamod:Source installed.
-- CounterStrikeSharp installed.
-- A working Warcraft mod built on CounterStrikeSharp.
-- .NET 8 SDK installed on the machine used to compile plugins.
-- Access to the server's `game/csgo/addons/counterstrikesharp/` directory.
+The normal player balance value is based on:
 
-A normal CounterStrikeSharp layout looks approximately like:
+| Component | Weight |
+|---|---:|
+| Recent ADR | 35% |
+| Recent K/D | 25% |
+| Persistent historical rating | 20% |
+| KAST/round contribution | 10% |
+| Objective contribution | 10% |
+
+That base player rating is then modified by:
+
+1. the automatically learned strength of the player's current **base race**;
+2. a small race-level modifier.
+
+Conceptually:
 
 ```text
-game/
-└── csgo/
-    └── addons/
-        ├── metamod/
-        └── counterstrikesharp/
-            ├── api/
-            ├── bin/
-            ├── dotnet/
-            ├── gamedata/
-            ├── plugins/
-            └── shared/
+Recent player performance
+        +
+Historical player skill
+        ↓
+Base player rating
+        ×
+Learned race modifier
+        ×
+Race-level modifier
+        ↓
+Current balance rating
 ```
 
-Official CounterStrikeSharp installation documentation:
-
-https://docs.cssharp.dev/docs/guides/getting-started.html
+The plugin uses that value differently depending on server population.
 
 ---
 
-# 2. What WarcraftAutoBalance Does
+# 2. Important v2.7 Warcraft Assumptions
 
-The balancer maintains a hidden rating for every human player.
+## 2.1 Base race is the persistent race identity
 
-The current rating model uses:
+The balancer needs to know the race the player actually selected.
 
-```text
-35%  Recent ADR
-25%  Recent K/D
-20%  Persistent historical rating
-10%  KAST / round contribution
-10%  Objective contribution
-```
-
-The player's base rating is then modified slightly by:
+For example:
 
 ```text
-Learned Race Modifier
-×
-Race Level Modifier
+Player selects Phoenix
+        ↓
+Phoenix ability kills player
+        ↓
+Phoenix respawns player in another form
 ```
 
-Bots are excluded from player rating and race-learning statistics.
-
-## Normal population
-
-With more than 6 humans:
-
-- Balance is normally checked every 4 rounds.
-- Team average ratings are compared.
-- Expected win probability is calculated.
-- Rebalancing normally begins at approximately 58/42.
-- The plugin attempts the best single human-for-human swap.
-- It aims to get the matchup to approximately 55/45 or better.
-- Players normally receive 12 rounds of move protection.
-
-## Low population
-
-With 2–6 humans:
-
-- Human counts are not forced to be equal.
-- Every possible human team partition is evaluated.
-- Effective combat power uses a nonlinear curve.
-- 1v2, 1v3, 1v4, and 1v5 are all possible.
-- Bots are used only as physical team fillers.
-
-This allows an exceptional player on a strong race to be placed against several weaker players.
-
-## Emergency disconnect balancing
-
-A severe player-count imbalance bypasses the normal 4-round wait.
-
-Example:
+The player's balance race should remain:
 
 ```text
-10v10
-↓
-two CT players disconnect
-↓
-10v8
-↓
-0.50 second disconnect coalescing period
-↓
-balancer evaluates the final 10v8 state
-↓
-best correction is selected using ratings
-↓
-9v9
-↓
-normal 58/42 strength check runs immediately
+Phoenix
 ```
 
-The emergency system changes the **timing**, not the rating model.
+Do **not** change the balance race merely because the player temporarily exists as a summon, alternate model, reincarnation, transformed unit, or other temporary form.
+
+The race that caused the mechanic should receive the long-term race-performance attribution.
+
+Only call `SetPlayerRace()` with a different race when the player's actual selected/base race changes.
+
+## 2.2 A respawn does not restore survival credit
+
+v2.7 defines survival as:
+
+```csharp
+bool survived = !round.Died;
+```
+
+If a player dies and a Warcraft race brings them back:
+
+```text
+Death
+→ round.Died = true
+→ Respawn
+→ player is alive again
+→ round.Died remains true
+```
+
+This is intentional.
+
+The extra life is a benefit of the race. It should not make the player appear to have survived the original life.
+
+Multiple actual deaths may still increase the player's round death count. That allows an extra-life race to expose the real combat cost of those additional lives rather than artificially limiting every player to one death per round.
+
+## 2.3 Summons are not additional human players
+
+Human population calculations use real, non-bot player controllers with valid SteamID64 values.
+
+A summon should not turn:
+
+```text
+3 humans vs 3 humans
+```
+
+into:
+
+```text
+4 vs 3
+```
+
+for the player-count expectation model.
+
+The race-learning system should instead discover that the summon-producing race wins more often than expected.
+
+## 2.4 Direct summon/projectile attribution is a future integration point
+
+The standalone plugin currently records normal human-vs-human game-event combat.
+
+If the Warcraft mod creates a custom summon/projectile whose attacker is not the owning human controller, WarcraftAutoBalance should **not guess** who owns that damage.
+
+That prevents incorrect attribution.
+
+For maximum future accuracy, the main Warcraft mod can expose the summon/projectile owner SteamID64 and report owner-attributed combat to the balance service.
+
+Race win/loss learning still captures a large part of summon power even without direct damage attribution.
 
 ---
 
-# 3. Recommended Project Structure
+# 3. Requirements
 
-For clean integration, use three projects or logical assemblies:
+The server should already have:
+
+1. a working CS2 dedicated server;
+2. Metamod:Source;
+3. CounterStrikeSharp;
+4. the main Warcraft mod;
+5. .NET 8-compatible CounterStrikeSharp plugin build tooling.
+
+Use the CounterStrikeSharp version already used by the Warcraft project wherever possible. Do not independently upgrade CounterStrikeSharp just for this plugin without checking the main mod first.
+
+---
+
+# 4. Recommended Project Layout
+
+A clean development solution can look like:
 
 ```text
 WarcraftServer/
+│
 ├── WarcraftMod/
 │   ├── WarcraftMod.csproj
 │   └── ...
@@ -151,29 +176,74 @@ WarcraftServer/
     └── IWarcraftBalanceService.cs
 ```
 
-`WarcraftBalance.Contracts` contains only the interface shared by both plugins.
+The **Contracts** project is strongly recommended.
 
-It should contain no gameplay logic.
+It prevents the main Warcraft plugin from directly depending on the complete AutoBalance implementation.
+
+The relationship becomes:
+
+```text
+WarcraftMod
+     │
+     └──── WarcraftBalance.Contracts
+                    ▲
+                    │
+WarcraftAutoBalance ┘
+```
+
+Both plugins know the small shared interface.
+
+Neither needs to compile directly against the other's implementation assembly.
 
 ---
 
-# 4. Create the Shared Contract
+# 5. Create the WarcraftAutoBalance Project
 
-Create a new .NET class library:
+Create a .NET 8 class library:
 
 ```bash
-dotnet new classlib -n WarcraftBalance.Contracts
+dotnet new classlib -n WarcraftAutoBalance -f net8.0
 ```
 
-Target .NET 8.
+Add the CounterStrikeSharp API package/version used by the main Warcraft mod.
+
+The project should reference:
+
+```text
+CounterStrikeSharp.API
+```
+
+Copy:
+
+```text
+WarcraftAutoBalance.cs
+```
+
+into the project.
+
+Remove the automatically generated `Class1.cs`.
+
+Build:
+
+```bash
+dotnet build -c Release
+```
+
+Before deployment, resolve **all compiler errors and warnings that indicate API mismatches** against the exact CounterStrikeSharp version installed on the server.
+
+---
+
+# 6. Create the Shared Contract
 
 Create:
 
 ```text
-WarcraftBalance.Contracts/IWarcraftBalanceService.cs
+WarcraftBalance.Contracts
 ```
 
-Use:
+as another .NET 8 class library.
+
+Example interface:
 
 ```csharp
 using CounterStrikeSharp.API.Core;
@@ -193,140 +263,43 @@ public interface IWarcraftBalanceService
 }
 ```
 
-The contract project needs access to CounterStrikeSharp types.
-
-Either reference the installed CounterStrikeSharp API DLL or add the API package.
-
-Example:
-
-```bash
-dotnet add package CounterStrikeSharp.API
-```
-
-Build:
-
-```bash
-dotnet build -c Release
-```
-
-You should get something similar to:
+Both projects reference this contract:
 
 ```text
-WarcraftBalance.Contracts/bin/Release/net8.0/WarcraftBalance.Contracts.dll
+WarcraftAutoBalance
+→ WarcraftBalance.Contracts
+
+WarcraftMod
+→ WarcraftBalance.Contracts
 ```
+
+Do not create separate copies of the interface in both projects.
+
+They must use the same shared contract assembly.
 
 ---
 
-# 5. Install the Shared Contract on the Server
+# 7. Expose WarcraftAutoBalance Through a Plugin Capability
 
-CounterStrikeSharp shared API contracts belong beneath the `shared` directory.
+The current v2.7 source exposes public `SetPlayerRace()` and `ClearPlayerRace()` methods.
 
-Create:
+For clean cross-plugin production integration, add a CounterStrikeSharp plugin capability to the balancer.
 
-```text
-game/csgo/addons/counterstrikesharp/shared/WarcraftBalance.Contracts/
-```
-
-Copy:
-
-```text
-WarcraftBalance.Contracts.dll
-```
-
-into it.
-
-Result:
-
-```text
-counterstrikesharp/
-└── shared/
-    └── WarcraftBalance.Contracts/
-        └── WarcraftBalance.Contracts.dll
-```
-
-Both the Warcraft mod and WarcraftAutoBalance should reference this exact contract assembly.
-
-Do not compile two different incompatible copies of the interface.
-
----
-
-# 6. Add the Contract Reference to WarcraftAutoBalance
-
-In the WarcraftAutoBalance project, reference the shared contract project during development.
-
-Example `.csproj`:
-
-```xml
-<Project Sdk="Microsoft.NET.Sdk">
-
-  <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <PackageReference Include="CounterStrikeSharp.API" Version="*" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\WarcraftBalance.Contracts\WarcraftBalance.Contracts.csproj" />
-  </ItemGroup>
-
-</Project>
-```
-
-If your friend already has a working CounterStrikeSharp project setup, use the same API version/reference strategy used by the main Warcraft plugin.
-
-Avoid blindly changing package versions on a working server.
-
----
-
-# 7. Make WarcraftAutoBalance Implement the Shared Interface
-
-At the top of `WarcraftAutoBalance.cs`, add:
+Add the contracts namespace:
 
 ```csharp
-using CounterStrikeSharp.API.Core.Capabilities;
 using WarcraftBalance.Contracts;
 ```
 
-Change:
+Make the plugin implement the service:
 
 ```csharp
-public class WarcraftAutoBalancePlugin : BasePlugin
-```
-
-to:
-
-```csharp
-public class WarcraftAutoBalancePlugin :
+public class WarcraftAutoBalance :
     BasePlugin,
     IWarcraftBalanceService
 ```
 
-The existing methods already match the interface:
-
-```csharp
-public void SetPlayerRace(
-    CCSPlayerController player,
-    string raceName,
-    int currentLevel,
-    int maximumLevel)
-```
-
-and:
-
-```csharp
-public void ClearPlayerRace(
-    CCSPlayerController player)
-```
-
----
-
-# 8. Expose WarcraftAutoBalance as a PluginCapability
-
-Inside `WarcraftAutoBalancePlugin`, add:
+Declare one capability ID:
 
 ```csharp
 public static PluginCapability<IWarcraftBalanceService>
@@ -340,21 +313,9 @@ The string:
 warcraft:autobalance
 ```
 
-is the capability ID.
+must be identical in both plugins.
 
-It must be identical in both plugins.
-
----
-
-# 9. Register the Capability
-
-Inside the balancer's existing:
-
-```csharp
-public override void Load(bool hotReload)
-```
-
-add:
+Register the provider during `Load()`:
 
 ```csharp
 Capabilities.RegisterPluginCapability(
@@ -363,70 +324,19 @@ Capabilities.RegisterPluginCapability(
 );
 ```
 
-A recommended placement is immediately after persistent data loads:
-
-```csharp
-public override void Load(bool hotReload)
-{
-    LoadPersistentData();
-
-    Capabilities.RegisterPluginCapability(
-        BalanceCapability,
-        () => this
-    );
-
-    RegisterEventHandler<EventRoundStart>(OnRoundStart);
-    RegisterEventHandler<EventRoundEnd>(OnRoundEnd);
-
-    RegisterEventHandler<EventPlayerHurt>(OnPlayerHurt);
-    RegisterEventHandler<EventPlayerDeath>(OnPlayerDeath);
-    RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
-
-    RegisterEventHandler<EventBombPlanted>(OnBombPlanted);
-    RegisterEventHandler<EventBombDefused>(OnBombDefused);
-
-    Logger.LogInformation(
-        "[WarcraftBalance] Loaded with {Players} player ratings and {Races} race profiles.",
-        _players.Count,
-        _raceStats.Count
-    );
-}
-```
-
-Now the Warcraft mod can obtain the balancing service without directly depending on the implementation class.
+The capability should be registered after the plugin has initialized its persistent data.
 
 ---
 
-# 10. Add the Contract Reference to the Main Warcraft Mod
+# 8. Consume the Capability From the Main Warcraft Mod
 
-Add the same contract project/reference to the main Warcraft mod.
-
-The Warcraft mod does **not** need a compile-time reference to:
-
-```text
-WarcraftAutoBalance.dll
-```
-
-It only needs:
-
-```text
-WarcraftBalance.Contracts.dll
-```
-
-This keeps the two plugins loosely coupled.
-
-At the top of the Warcraft plugin file:
+In the Warcraft mod:
 
 ```csharp
-using CounterStrikeSharp.API.Core.Capabilities;
 using WarcraftBalance.Contracts;
 ```
 
----
-
-# 11. Declare the Capability in the Main Warcraft Mod
-
-Inside the main Warcraft plugin class, add:
+Declare:
 
 ```csharp
 public static PluginCapability<IWarcraftBalanceService>
@@ -434,17 +344,7 @@ public static PluginCapability<IWarcraftBalanceService>
         new("warcraft:autobalance");
 ```
 
-Again, the string must exactly match the provider:
-
-```text
-warcraft:autobalance
-```
-
----
-
-# 12. Create a Safe Helper in the Main Mod
-
-Add a helper function to the Warcraft mod:
+Add a helper:
 
 ```csharp
 private IWarcraftBalanceService? GetBalanceService()
@@ -453,1050 +353,1801 @@ private IWarcraftBalanceService? GetBalanceService()
 }
 ```
 
-Always assume it can return `null`.
+The Warcraft mod should remain functional if the balance plugin is unavailable.
 
-That allows the Warcraft mod to continue functioning even if the balancer is temporarily missing, disabled, or hot-reloading.
+Therefore use null-safe calls:
 
-Do not make Warcraft gameplay depend on the balancer being present.
+```csharp
+GetBalanceService()?.SetPlayerRace(...);
+```
+
+Do not make normal Warcraft gameplay depend on the balancer being loaded.
 
 ---
 
-# 13. Send Race Information When a Player Selects a Race
+# 9. Where the Warcraft Mod Must Synchronize Race Data
 
-Locate the section of the Warcraft mod where a player's race is successfully selected.
+The balancer should be updated whenever the player's **real selected/base race state** changes.
 
-After the race has been assigned internally, call:
+## 9.1 Player profile/race loads
+
+After the Warcraft mod has loaded the player's current race:
 
 ```csharp
-var balance = GetBalanceService();
-
-balance?.SetPlayerRace(
+GetBalanceService()?.SetPlayerRace(
     player,
     race.Name,
     playerRaceLevel,
-    race.MaximumLevel
+    race.MaxLevel
 );
 ```
 
-The exact property names depend on the main Warcraft mod.
+## 9.2 Player selects another race
 
-For example, if your current code looks like:
-
-```csharp
-playerData.CurrentRace = selectedRace;
-playerData.RaceLevel = selectedLevel;
-```
-
-add:
+Immediately after the Warcraft mod commits the new selection:
 
 ```csharp
-var balance = GetBalanceService();
-
-balance?.SetPlayerRace(
+GetBalanceService()?.SetPlayerRace(
     player,
     selectedRace.Name,
-    selectedLevel,
+    selectedRaceLevel,
     selectedRace.MaxLevel
 );
 ```
 
-Only call the balancer **after** the Warcraft mod considers the race selection valid.
+## 9.3 Race level changes
 
----
-
-# 14. Update the Balancer When Race Level Changes
-
-Whenever the player's active race level changes, call `SetPlayerRace` again.
-
-Example:
+If a level increase changes the player's race level:
 
 ```csharp
-playerData.RaceLevel++;
-
-var balance = GetBalanceService();
-
-balance?.SetPlayerRace(
+GetBalanceService()?.SetPlayerRace(
     player,
-    playerData.CurrentRace.Name,
-    playerData.RaceLevel,
-    playerData.CurrentRace.MaxLevel
+    currentRace.Name,
+    newLevel,
+    currentRace.MaxLevel
 );
 ```
 
-`SetPlayerRace` is intentionally safe to call repeatedly.
+## 9.4 True no-race state
 
-It replaces the current assignment.
-
----
-
-# 15. Clear Race Information When Necessary
-
-When a player no longer has an active race, call:
+Only call:
 
 ```csharp
 GetBalanceService()?.ClearPlayerRace(player);
 ```
 
-Good places include:
+when the player genuinely has no selected/base race.
 
-- player explicitly deselects a race;
-- Warcraft profile resets;
-- race becomes invalid;
-- race is removed by an admin;
-- plugin logic intentionally places player into a no-race state.
+Do not clear it during a normal death.
 
-A normal team switch does **not** necessarily require clearing the race if Warcraft races persist between T and CT.
+Do not clear it during a race-controlled respawn.
+
+Do not clear it because the player temporarily becomes a summon.
+
+Do not clear it because a pawn is destroyed and recreated.
 
 ---
 
-# 16. Restore Race Information After Player Connect / Profile Load
+# 10. Respawns and Temporary Summon Forms
 
-This step is important.
+This is especially important for this Warcraft implementation.
 
-WarcraftAutoBalance stores player/race statistics persistently, but the currently selected race assignment is runtime state.
+Suppose:
 
-After the Warcraft mod finishes loading a player's profile, send their current race to the balancer.
+```text
+Base race: Necromancer
+
+Player dies
+→ ability triggers
+→ player respawns as Skeleton
+→ later returns to normal
+```
+
+Do **not** send:
+
+```csharp
+SetPlayerRace(player, "Skeleton", ...);
+```
+
+unless Skeleton is actually the player's newly selected race.
+
+Keep:
+
+```text
+Necromancer
+```
+
+as the balance race.
+
+Why?
+
+Because if Necromancer's ability gives players an extra life as a Skeleton, that extra power belongs to **Necromancer's learned race modifier**.
+
+Changing the balance assignment to Skeleton would incorrectly split the statistical effect between two races.
+
+---
+
+# 11. Round-Start Snapshots
+
+v2.7 snapshots human state at round start.
+
+Each player's current-round data records:
+
+```text
+SteamID64
+team at round start
+base race at round start
+race-level modifier at round start
+damage
+kills
+deaths
+assists
+objective contribution
+whether the player died
+```
+
+The race-learning win expectation is also captured at round start.
+
+Later events cannot retroactively change the expected result:
+
+```text
+disconnect
+respawn
+summon transformation
+pawn recreation
+mid-round team-state change
+```
+
+This is deliberate.
+
+---
+
+# 12. Uneven Round-Start Population
+
+Normal average rating alone does not represent a numerical advantage.
+
+For race-learning expectations, v2.7 applies:
+
+```csharp
+private const double PlayerCountExpectationAdjustment = 75.0;
+```
+
+Conceptually:
+
+```text
+CT average skill = 1000
+T average skill  = 1000
+
+CT has one extra real human
+
+Adjusted CT expectation rating:
+1000 + 75 = 1075
+```
+
+The existing Elo-style expected-win function is then applied.
+
+Only real human players affect this count.
+
+Bots and summon entities do not.
+
+This adjustment affects **race-learning expected wins**, not the normal player rating formula.
+
+---
+
+# 13. Human Combat Statistics
+
+Direct player statistics are intentionally human-vs-human.
+
+Damage is counted only when:
+
+```text
+attacker = usable human
+victim   = usable human
+attacker != victim
+attacker team != victim team
+```
+
+Kills and assists follow the same philosophy.
+
+This means:
+
+```text
+human damages bot     → ignored
+human kills bot       → ignored
+human assists vs bot  → ignored
+```
+
+Bots therefore cannot inflate a human's ADR/KD/KAST rating.
+
+---
+
+# 14. Rating Formula
+
+The default weights are:
+
+```csharp
+AdrWeight        = 0.35;
+KdWeight         = 0.25;
+HistoricalWeight = 0.20;
+KastWeight       = 0.10;
+ObjectiveWeight  = 0.10;
+```
+
+The recent window is:
+
+```csharp
+RollingWindowRounds = 12;
+```
+
+Normalization roughly treats:
+
+```text
+100 ADR        ≈ 1000
+1.0 K/D        ≈ 1000
+70% KAST       ≈ 1000
+0.15 objective points/round ≈ 1000
+```
+
+The result is:
+
+```text
+BaseRating =
+    ADR rating × 35%
+  + K/D rating × 25%
+  + Historical rating × 20%
+  + KAST rating × 10%
+  + Objective rating × 10%
+```
+
+Then:
+
+```text
+FinalRating =
+    BaseRating
+    × RaceModifier
+    × LevelModifier
+```
+
+---
+
+# 15. Historical Rating
+
+New players begin at approximately:
+
+```text
+1000
+```
+
+The historical rating uses a slow exponential update toward recent performance.
+
+Current learning rate:
+
+```csharp
+HistoricalLearningRate = 0.05;
+```
+
+Historical rating is clamped approximately to:
+
+```text
+600–1600
+```
+
+This prevents one unusually good or bad session from completely rewriting the player's long-term rating.
+
+The player is identified by:
+
+```text
+SteamID64
+```
+
+not:
+
+```text
+name
+slot
+entity index
+current session
+```
+
+A name change therefore does not create a new player rating.
+
+---
+
+# 16. Automated Race Strength Learning
+
+Race strength is not manually hardcoded.
+
+The plugin tracks:
+
+```text
+race rounds played
+actual race wins
+expected race wins
+last learned modifier
+```
+
+The key idea is:
+
+```text
+Race performance =
+actual wins - expected wins
+```
+
+not simply raw win percentage.
 
 Example:
 
-```csharp
-private void SyncRaceToBalancer(
-    CCSPlayerController player,
-    WarcraftPlayerData data)
-{
-    if (data.CurrentRace == null)
-    {
-        GetBalanceService()?.ClearPlayerRace(player);
-        return;
-    }
-
-    GetBalanceService()?.SetPlayerRace(
-        player,
-        data.CurrentRace.Name,
-        data.RaceLevel,
-        data.CurrentRace.MaxLevel
-    );
-}
+```text
+Race actual win rate:   57%
+Expected from users:    54%
+Observed race edge:      3%
 ```
 
-Call this after the player's Warcraft profile/race data is available.
+This is much better than declaring the race +7% strong merely because good players prefer it.
 
-Do not send race information before the main mod knows the correct race.
-
----
-
-# 17. Handle Hot Reloads
-
-CounterStrikeSharp can hot reload plugins.
-
-Because capability resolution can temporarily return `null`, always use:
+Race learning begins after:
 
 ```csharp
-BalanceCapability.Get()
+RaceMinimumSampleRounds = 40;
 ```
 
-when needed instead of permanently caching the service forever.
+and uses shrinkage toward neutral for smaller samples.
 
-Good:
-
-```csharp
-BalanceCapability.Get()?.SetPlayerRace(...);
-```
-
-Less desirable:
-
-```csharp
-private IWarcraftBalanceService _balanceService;
-```
-
-held forever without refreshing it.
-
-After a Warcraft mod hot reload, resync all currently connected humans.
-
-Pseudo-code:
-
-```csharp
-foreach (var player in Utilities.GetPlayers())
-{
-    if (!player.IsValid || player.IsBot)
-        continue;
-
-    var profile = GetWarcraftProfile(player);
-
-    if (profile?.CurrentRace == null)
-        continue;
-
-    BalanceCapability.Get()?.SetPlayerRace(
-        player,
-        profile.CurrentRace.Name,
-        profile.RaceLevel,
-        profile.CurrentRace.MaxLevel
-    );
-}
-```
-
----
-
-# 18. Build WarcraftAutoBalance
-
-From its project directory:
-
-```bash
-dotnet restore
-dotnet build -c Release
-```
-
-Expected output:
+Default race modifier bounds are:
 
 ```text
-bin/
-└── Release/
-    └── net8.0/
-        ├── WarcraftAutoBalance.dll
-        ├── WarcraftAutoBalance.deps.json
-        └── WarcraftAutoBalance.pdb
+0.95–1.05
 ```
-
-The exact files depend on the project configuration.
 
 ---
 
-# 19. Install WarcraftAutoBalance on the Server
+# 17. Race Level Modifier
 
-Create:
+Race level is deliberately a small adjustment.
+
+Current range is approximately:
+
+```text
+0.98–1.02
+```
+
+A strong player does not suddenly become weak because they changed to a low-level race, and a weak player does not become elite merely because a race is maxed.
+
+Race level supplements the skill model rather than replacing it.
+
+---
+
+# 18. Normal Population Balancing
+
+For more than six real humans, normal population logic applies.
+
+The plugin evaluates balance every:
+
+```csharp
+BalanceEveryRounds = 4;
+```
+
+The normal trigger is:
+
+```csharp
+BalanceTriggerWinChance = 0.58;
+```
+
+So a team must be approximately:
+
+```text
+58/42 or worse
+```
+
+before a skill-based swap is considered.
+
+This prevents unnecessary player movement for trivial differences such as:
+
+```text
+51/49
+52/48
+```
+
+The preferred post-swap target is:
+
+```csharp
+TargetWinChance = 0.55;
+```
+
+or approximately:
+
+```text
+55/45 or better
+```
+
+`FindBestSingleSwap()` evaluates every T/CT human pair and chooses the candidate producing the result closest to 50/50.
+
+It does **not** stop at the first merely acceptable 55/45 candidate.
+
+---
+
+# 19. No Swap Protection
+
+There is intentionally:
+
+```text
+NO 12-round move protection
+NO LastMovedRound
+NO protected-player flag
+NO balance immunity after a move
+```
+
+This is deliberate for this server.
+
+Players may:
+
+```text
+change races frequently
+join frequently
+leave frequently
+change the effective strength of a team rapidly
+```
+
+A protection period approaching the length of an entire map would prevent the balancer from responding.
+
+A player can therefore be moved again if the current server state genuinely requires it.
+
+---
+
+# 20. Adaptive Low-Population Mode
+
+Low-pop mode applies when there are:
+
+```csharp
+2–6 real humans
+```
+
+Bots are not used to decide human strength.
+
+Instead, every valid human partition is evaluated.
+
+Possible outcomes include:
+
+```text
+1v1
+1v2
+1v3
+1v4
+1v5
+2v2
+2v3
+2v4
+3v3
+```
+
+The system does not force equal human counts.
+
+---
+
+# 21. Low-Population Effective Power
+
+Simply adding 1000-based ratings makes elite-vs-many arrangements almost impossible.
+
+v2.7 therefore uses nonlinear power:
+
+```csharp
+power =
+    Math.Exp(
+        (finalRating - 1000) /
+        LowPopulationPowerScale
+    );
+```
+
+with:
+
+```csharp
+LowPopulationPowerScale = 300.0;
+```
+
+Approximate examples:
+
+```text
+1000 rating → 1.00 power
+1300 rating → 2.72 power
+1600 rating → 7.39 power
+```
+
+Therefore an extremely strong player on a strong race can legitimately be evaluated against several weaker humans.
+
+The selected partition is the one with the closest total effective power.
+
+---
+
+# 22. Low-Pop Bot Distribution
+
+Humans are balanced first.
+
+Bots are filler second.
+
+v2.7 does **not** switch humans and immediately re-read their `Team` property to determine bot placement.
+
+Instead:
+
+```text
+selected human partition
+        ↓
+known logical T human count
+known logical CT human count
+        ↓
+bot redistribution
+```
+
+Bot redistribution evaluates every possible split of the existing bots and chooses:
+
+1. the smallest final physical team-count difference;
+2. the fewest bot moves as a tiebreaker.
+
+It preselects distinct bots before `SwitchTeam()` calls, so it does not depend on engine team state updating synchronously in the same frame.
+
+---
+
+# 23. Emergency Disconnect Balancing
+
+Disconnects do not wait for the normal four-round interval.
+
+The plugin listens for player disconnects and queues an emergency population check after approximately:
+
+```csharp
+DisconnectRebalanceDelaySeconds = 0.50f;
+```
+
+Multiple disconnects during that short window are coalesced.
+
+Example:
+
+```text
+10v10
+→ player disconnects
+→ 10v9
+→ another disconnects immediately
+→ 10v8
+
+one emergency evaluation occurs
+```
+
+The emergency physical-count trigger is:
+
+```csharp
+EmergencyTeamCountDifference = 2;
+```
+
+So:
+
+```text
+10v9 → no forced emergency count move
+10v8 → emergency correction
+10v6 → emergency correction with multiple moves if required
+```
+
+---
+
+# 24. Emergency Multi-Move State
+
+Emergency correction maintains its own logical T and CT collections.
+
+When it chooses a move:
+
+```text
+remove controller from logical source
+add controller to logical destination
+call SwitchTeam()
+```
+
+The next emergency decision therefore uses the intended logical state rather than assuming CounterStrikeSharp/CS2 has already updated `player.Team` during the same frame.
+
+Bots on the oversized side are preferred as unrated physical filler.
+
+If a human must move, the plugin uses the full human rating model to select the move that creates the best projected matchup.
+
+---
+
+# 25. Post-Emergency Strength Check
+
+Fixing physical counts does not automatically mean the teams are balanced.
+
+After emergency count correction:
+
+```csharp
+Server.NextFrame(EvaluateTeamBalance);
+```
+
+runs the normal strength model.
+
+Example:
+
+```text
+10v8
+→ emergency count correction
+→ 9v9
+→ projected strength still 61/39
+→ normal 58/42 trigger is violated
+→ best 1-for-1 skill swap
+→ projected 52/48
+```
+
+If the corrected result is already acceptable:
+
+```text
+10v8
+→ 9v9
+→ projected 54/46
+→ no additional skill swap
+```
+
+---
+
+# 26. Required/Recommended CS2 ConVars
+
+Because WarcraftAutoBalance owns team redistribution, disable native CS2 balancing:
+
+```cfg
+mp_autoteambalance 0
+mp_limitteams 0
+```
+
+The package includes:
+
+```text
+warcraft_autobalance_server.cfg
+```
+
+You can execute it from the server configuration or place the equivalent convars directly in your normal server config.
+
+Do not leave native auto-balance active while testing this plugin.
+
+Otherwise CS2 may undo or interfere with WarcraftAutoBalance decisions.
+
+---
+
+# 27. Plugin Deployment
+
+After a successful Release build, deploy the plugin under the normal CounterStrikeSharp plugin directory, for example:
 
 ```text
 game/csgo/addons/counterstrikesharp/plugins/WarcraftAutoBalance/
 ```
 
-Copy the built files into it.
+The directory should contain the plugin assembly and required managed dependencies.
 
-Example:
+Conceptually:
 
 ```text
-counterstrikesharp/
-└── plugins/
-    └── WarcraftAutoBalance/
-        ├── WarcraftAutoBalance.dll
-        ├── WarcraftAutoBalance.deps.json
-        └── WarcraftAutoBalance.pdb
+game/
+└── csgo/
+    └── addons/
+        └── counterstrikesharp/
+            ├── plugins/
+            │   ├── WarcraftMod/
+            │   └── WarcraftAutoBalance/
+            │       ├── WarcraftAutoBalance.dll
+            │       └── ...
+            │
+            └── shared/
+                └── WarcraftBalance.Contracts/
+                    └── WarcraftBalance.Contracts.dll
 ```
 
-If additional dependency DLLs are produced and are not supplied by CounterStrikeSharp/shared resolution, copy those as required.
+Use the dependency layout expected by the CounterStrikeSharp version installed on the server.
 
 ---
 
-# 20. Install / Update the Main Warcraft Mod
+# 28. Shared Contract Deployment
 
-Build the modified Warcraft mod.
-
-Deploy its normal output exactly as you already deploy the Warcraft plugin.
-
-Do not replace unrelated Warcraft configuration or player data files.
-
-At this point both plugins should reference the shared contract:
+The exact same compiled:
 
 ```text
-shared/
-└── WarcraftBalance.Contracts/
-    └── WarcraftBalance.Contracts.dll
+WarcraftBalance.Contracts.dll
 ```
+
+must be available to both plugins.
+
+Recommended shared location:
+
+```text
+game/csgo/addons/counterstrikesharp/shared/WarcraftBalance.Contracts/
+```
+
+Do not deploy different builds of the contract DLL to each plugin.
+
+That can cause type identity/capability resolution problems.
 
 ---
 
-# 21. Recommended Final Server Layout
+# 29. Plugin Load Order and Resynchronization
 
-Example:
+The Warcraft mod should not assume AutoBalance always loads first.
 
-```text
-game/csgo/addons/counterstrikesharp/
-├── api/
-├── bin/
-├── dotnet/
-├── gamedata/
-├── plugins/
-│   ├── WarcraftMod/
-│   │   ├── WarcraftMod.dll
-│   │   ├── WarcraftMod.deps.json
-│   │   └── ...
-│   │
-│   └── WarcraftAutoBalance/
-│       ├── WarcraftAutoBalance.dll
-│       ├── WarcraftAutoBalance.deps.json
-│       ├── WarcraftAutoBalance.pdb
-│       └── balance_data.json       <-- created automatically later
-│
-└── shared/
-    └── WarcraftBalance.Contracts/
-        └── WarcraftBalance.Contracts.dll
-```
-
----
-
-# 22. First Startup
-
-Restart the server.
-
-Watch the console.
-
-You should see a message similar to:
-
-```text
-[WarcraftBalance] Loaded with 0 player ratings and 0 race profiles.
-```
-
-On later starts it may say:
-
-```text
-[WarcraftBalance] Loaded with 145 player ratings and 23 race profiles.
-```
-
-If the plugin does not load, check CounterStrikeSharp's plugin list and server console errors before testing gameplay.
-
----
-
-# 23. Verify the Capability Connection
-
-Temporarily add a log message in the Warcraft mod after resolving the service:
+On normal race events:
 
 ```csharp
-var balance = BalanceCapability.Get();
+GetBalanceService()?.SetPlayerRace(...);
+```
 
-if (balance == null)
+is safe if the service is absent.
+
+For hot reloads, provide a resynchronization path.
+
+After the balancer becomes available, iterate currently connected Warcraft players and resend their current base race and level:
+
+```csharp
+foreach (CCSPlayerController player in activePlayers)
 {
-    Logger.LogWarning(
-        "WarcraftAutoBalance capability was not available."
-    );
-}
-else
-{
-    Logger.LogInformation(
-        "WarcraftAutoBalance capability connected."
+    PlayerRaceState state =
+        GetCurrentRaceState(player);
+
+    GetBalanceService()?.SetPlayerRace(
+        player,
+        state.RaceName,
+        state.Level,
+        state.MaxLevel
     );
 }
 ```
 
-On server startup/profile sync you want:
+The exact hook depends on the architecture of the main Warcraft mod.
+
+The important rule is:
 
 ```text
-WarcraftAutoBalance capability connected.
+AutoBalance reload
+→ current connected players must eventually be re-sent
+→ current base race/level
 ```
-
-If it returns null:
-
-1. Confirm WarcraftAutoBalance loaded.
-2. Confirm both plugins use exactly:
-
-```text
-warcraft:autobalance
-```
-
-3. Confirm both use the same `IWarcraftBalanceService` contract.
-4. Confirm the contract DLL exists under CounterStrikeSharp `shared`.
-5. Check assembly/version errors in server console.
 
 ---
 
-# 24. Verify Race Sync
+# 30. Team-Owned Warcraft Entities
 
-Temporarily log the data being sent from Warcraft:
+Automatic team movement can interact badly with Warcraft entities such as:
+
+```text
+clones
+summons
+portals
+traps
+wards
+projectiles
+auras
+team-owned NPCs
+```
+
+The main Warcraft mod should have one central team-change cleanup path.
+
+Conceptually:
 
 ```csharp
-Logger.LogInformation(
-    "Balance sync: {Player} = {Race} level {Level}/{Max}",
-    player.PlayerName,
-    race.Name,
-    currentLevel,
-    maximumLevel
-);
+void OnAutoBalanceTeamChanged(
+    CCSPlayerController player,
+    CsTeam oldTeam,
+    CsTeam newTeam)
+{
+    RemoveOrRetargetClones(player);
+    RemoveOrRetargetSummons(player);
+    RemoveOrRetargetPortals(player);
+    RemoveOrRetargetTraps(player);
+    RemoveOrRetargetProjectiles(player);
+    RefreshTeamAuras(player);
+}
 ```
 
-Change race several times.
+Do not duplicate this cleanup independently in several race classes if the Warcraft framework can centralize it.
 
-Verify the correct race and level are sent.
-
-Remove the debug logging after validation.
+A future extension of `IWarcraftBalanceService` or a Warcraft-side team-change hook can formalize this.
 
 ---
 
-# 25. Verify Persistent Data
+# 31. Persistence
 
-After several rounds, inspect:
+Persistent data is stored at:
 
 ```text
-game/csgo/addons/counterstrikesharp/plugins/WarcraftAutoBalance/balance_data.json
+<WarcraftAutoBalance ModuleDirectory>/balance_data.json
 ```
 
-It should contain persistent player and race data.
+The plugin loads JSON into in-memory dictionaries.
 
-Do not manually edit this file while the server/plugin is actively writing it.
+Runtime player lookup is therefore effectively:
 
-Back it up before manual edits.
+```csharp
+Dictionary<ulong, PlayerBalanceData>
+```
 
-The file should survive:
+using SteamID64.
 
-- map changes;
-- plugin reloads;
-- server restarts.
+The JSON file itself is not a database index.
+
+Performance comes from:
+
+```text
+disk JSON
+→ load once
+→ dictionaries in RAM
+→ gameplay reads/writes RAM
+→ batched persistence
+```
+
+This is appropriate for a single Warcraft server and a normal community-server player history.
 
 ---
 
-# 26. Verify the Admin Command
+# 32. SteamID64 Identity
 
-The plugin registers:
+Persistent player data is keyed by:
+
+```text
+SteamID64
+```
+
+The player's name is metadata only.
+
+Test this explicitly:
+
+1. join as PlayerNameA;
+2. accumulate rating data;
+3. stop server/plugin and confirm JSON is saved;
+4. change Steam display name;
+5. reconnect;
+6. confirm the same SteamID64 record is reused and the name field updates.
+
+Do not use player slot or entity index as persistent identity.
+
+---
+
+# 33. Persistent Race Data
+
+Race records retain approximately:
+
+```text
+RaceName
+RoundsPlayed
+ActualWins
+ExpectedWins
+LastCalculatedModifier
+```
+
+The race dictionary is case-insensitive.
+
+Race naming should nevertheless be canonical in the main Warcraft mod.
+
+Avoid sending:
+
+```text
+Internet Troll
+internet troll
+InternetTroll
+The Internet Troll
+```
+
+for the same race.
+
+Use the actual internal/display race name consistently.
+
+---
+
+# 34. Saving Behavior
+
+Persistent data is saved on:
+
+```text
+plugin unload
+scheduled balance intervals
+emergency corrections where applicable
+```
+
+The plugin writes through a temporary file and replaces the primary JSON file.
+
+This is safer than writing directly over the active file.
+
+Still back up:
+
+```text
+balance_data.json
+```
+
+before major migrations or experimental rating changes.
+
+---
+
+# 35. Admin Diagnostics
+
+The plugin exposes:
 
 ```text
 css_balance
 ```
 
-With `!` configured as the public chat trigger, admins can use:
+and, when `!` is configured as a public CounterStrikeSharp command trigger:
 
 ```text
 !balance
 ```
 
-The command requires:
+The command is protected by:
 
-```text
-@css/generic
+```csharp
+[RequiresPermissions("@css/generic")]
 ```
 
-Expected diagnostics include:
+so it is intended for administrators.
 
-- T average rating;
-- CT average rating;
-- expected win probability;
-- player ratings;
-- ADR;
-- K/D;
-- KAST approximation;
-- historical rating;
-- current race;
-- race modifier;
-- level modifier;
-- recommended normal-pop swap;
-- low-pop recommended partition;
-- learned race performance.
+Diagnostics include information such as:
+
+```text
+T/CT average rating
+expected win chance
+individual player ratings
+ADR
+K/D
+KAST
+historical rating
+race
+race modifier
+level modifier
+recommended swap
+learned race performance
+```
+
+Low-pop diagnostics use the low-pop partition/power model rather than pretending the match must be equal human counts.
 
 ---
 
-# 27. Test Normal Population Balancing
+# 36. First Startup Test
 
-Use more than 6 humans.
+Before testing automatic movement:
+
+1. start the server;
+2. confirm CounterStrikeSharp loads;
+3. confirm the Warcraft mod loads;
+4. confirm WarcraftAutoBalance loads;
+5. inspect server logs for the AutoBalance startup message;
+6. confirm no plugin exceptions;
+7. connect one real Steam player;
+8. select a Warcraft race;
+9. verify the Warcraft mod sends the race assignment;
+10. execute `!balance` as an authorized admin.
+
+Do not begin live balancing tests until this basic path works.
+
+---
+
+# 37. Race Synchronization Test
+
+Use one player and deliberately change races.
 
 Example:
 
 ```text
-T average: 1215
-CT average: 1010
+Round 1: Internet Troll
+Round 2: Human Alliance
+Round 3: Internet Troll
 ```
 
-Allow the server to reach a 4-round balance check.
+After each actual selection, ensure the balance integration calls:
 
-If the predicted stronger-team win chance is under 58%, no swap should occur.
+```csharp
+SetPlayerRace(...)
+```
 
-If above approximately 58%, the plugin should evaluate single swaps.
+with the new base race and level.
 
-The selected swap should improve the predicted matchup.
-
----
-
-# 28. Test Move Protection
-
-After a normal skill swap, the player should normally be protected for:
+Then test a temporary transformation:
 
 ```text
-12 rounds
+Internet Troll
+→ dies
+→ ability temporarily respawns as Murloc summon/form
 ```
 
-The balancer should prefer other valid moves during that period.
+The balance race should remain:
 
-Emergency population correction can override this if the teams become severely uneven.
+```text
+Internet Troll
+```
+
+unless the player actually selected Murloc as their new base race.
 
 ---
 
-# 29. Test Low-Population Mode
+# 38. Respawn/KAST Test
 
-Use 2–6 human players.
-
-Bots can remain enabled.
-
-The balancer should ignore bot skill entirely.
+Use a race capable of respawning.
 
 Test:
 
 ```text
-1 strong human
-vs
-2 weaker humans
+Player starts round
+→ dies
+→ race respawns player
+→ player is alive when round ends
 ```
 
-Then test more extreme rating differences.
-
-The system is allowed to create:
+Expected balance statistics:
 
 ```text
-1v3
-1v4
-1v5
+Deaths >= 1
+Survived = false
 ```
 
-if the nonlinear effective-power calculation says that is the closest matchup.
+The respawn should not erase the death.
 
-The current power formula is approximately:
+Then test a player who never dies:
 
 ```text
-power = exp((finalRating - 1000) / 300)
+Deaths = 0
+Survived = true
 ```
-
-The `300` value is:
-
-```csharp
-LowPopulationPowerScale
-```
-
-Lower value:
-
-```text
-elite-vs-many becomes more aggressive
-```
-
-Higher value:
-
-```text
-elite-vs-many becomes more conservative
-```
-
-Do not tune this until the server has enough real rating data.
 
 ---
 
-# 30. Test Bots in Low Population
+# 39. Bot Isolation Test
 
-Example:
+Run a server with humans and bots.
 
-```text
-10 total players
-3 humans
-7 bots
-```
-
-If ratings justify:
+Have a human:
 
 ```text
-Human A
-vs
-Human B + Human C
+damage bots
+kill bots
+assist against bots
 ```
 
-the final physical teams may become:
+Those actions should not inflate the human's rating statistics.
 
-```text
-T:
-Human A
-4 bots
+Then fight another real human and confirm normal damage/kills/assists are recorded.
 
-CT:
-Human B
-Human C
-3 bots
-```
-
-Bots should not appear in persistent player ratings.
+Bots should affect physical team filling only.
 
 ---
 
-# 31. Test Emergency Disconnect Balancing
+# 40. Normal 4-Round Balance Test
 
-Start:
+Use more than six humans.
+
+Create deliberately unequal player ratings if necessary using test data.
+
+Verify:
 
 ```text
-10v10
+round 1 → no scheduled balance
+round 2 → no scheduled balance
+round 3 → no scheduled balance
+round 4 → EvaluateTeamBalance
 ```
 
-Have two players from the same team disconnect nearly simultaneously.
+Test a projected matchup below the trigger:
+
+```text
+56/44
+```
 
 Expected:
 
 ```text
-10v10
-→ 10v8
-→ approximately 0.50 seconds
-→ evaluate candidates
-→ 9v9
+no skill swap
 ```
 
-The plugin does not simply move the top-rated player.
-
-It evaluates each possible correction using projected ratings and expected win probabilities.
-
-Then it immediately performs the normal 58/42 strength check again.
-
-Possible result:
+Test:
 
 ```text
-10v8
-→ candidate correction
-→ 9v9 at 61/39
-→ still too lopsided
-→ best 1-for-1 skill swap
-→ 9v9 at 52/48
+60/40
 ```
 
----
-
-# 32. Warcraft-Specific Team-Change Cleanup
-
-This is strongly recommended.
-
-Your main Warcraft mod may own team-sensitive objects such as:
-
-- summons;
-- clones;
-- traps;
-- portals;
-- projectiles;
-- auras;
-- team-based target lists;
-- team-colored entities.
-
-When WarcraftAutoBalance switches a player, CS2 changes their team but your Warcraft plugin may still have entities associated with the player's previous team.
-
-Create a Warcraft-side cleanup routine.
-
-For example:
-
-```csharp
-public void CleanupPlayerTeamEntities(
-    CCSPlayerController player)
-{
-    RemovePlayerSummons(player);
-    RemovePlayerClones(player);
-    RemovePlayerPortals(player);
-    RemovePlayerTraps(player);
-}
-```
-
-Exactly what gets removed depends on the Warcraft mod.
-
-Ideally, the Warcraft mod should already have a general "player changed team" or cleanup pathway used for normal team changes.
-
-The balancer should cause that same cleanup path to run.
-
-Do not let an Internet Troll clone, summon, portal, or other entity silently remain owned by the old team after an auto-balance move.
-
----
-
-# 33. Ability Damage Attribution
-
-WarcraftAutoBalance currently learns damage from CS2's normal player-damage event.
-
-If Warcraft abilities correctly attribute their damage to the owning player through CS2 events, nothing else is necessary.
-
-If custom summons/projectiles deal damage without the owner being represented as the attacker, that damage may not contribute to the player's ADR.
-
-For maximum accuracy, the long-term integration should expose an additional function such as:
-
-```csharp
-void RecordWarcraftDamage(
-    CCSPlayerController player,
-    int damage);
-```
-
-Then the Warcraft mod can explicitly report custom damage.
-
-This is optional for initial deployment.
-
-First test how your existing Warcraft damage appears in `player_hurt`.
-
----
-
-# 34. Summon Kills and Race Effects
-
-The same principle applies to kills and assists.
-
-If the CS2 event system attributes a summon/projectile kill to the player, the current balancer receives it normally.
-
-If the kill has no owning human attacker, it may not count toward the player's K/D contribution.
-
-Do not artificially add duplicate kill credit.
-
-Determine first whether the normal event already reports the owner.
-
----
-
-# 35. Warmup and Halftime Testing
-
-Before production use, explicitly test:
-
-- server warmup;
-- map start;
-- halftime;
-- automatic CS2 side swaps;
-- overtime if enabled;
-- map changes.
-
-The current balancing source should not be assumed to understand every custom Warcraft server's match lifecycle automatically.
-
-Watch for:
+Expected:
 
 ```text
-balance occurring during warmup
+best available single swap is evaluated
 ```
 
-or:
-
-```text
-balance immediately fighting against a halftime side swap
-```
-
-If either occurs, add a server-state guard around balance execution.
+Confirm the plugin chooses the candidate closest to 50/50 rather than the first candidate below 55/45.
 
 ---
 
-# 36. Recommended Deployment Process
+# 41. Repeated-Move Test
 
-Do not deploy directly to the live server first.
+Because move protection is intentionally gone, explicitly test:
+
+```text
+Player A moved at balance pass
+→ several players change race or leave
+→ next balance pass determines Player A is again the best move
+```
+
+Expected:
+
+```text
+Player A is eligible again
+```
+
+There should be no:
+
+```text
+LastMovedRound
+12-round cooldown
+protected flag
+```
+
+preventing the decision.
+
+---
+
+# 42. Low-Pop 3-Human Test
 
 Use:
 
 ```text
-1. Development/local server
-2. Compile
-3. Start with bots
-4. Check plugin load
-5. Check capability connection
-6. Check race sync
-7. Check balance_data.json
-8. Test !balance
-9. Test normal 4-round balancing
-10. Test low-pop balancing
-11. Test disconnect emergency
-12. Test Warcraft entities after team switches
-13. Test map change
-14. Test hot reload
-15. Deploy to production
+3 real humans
+7 bots
 ```
+
+Give one human a substantially higher balance rating.
+
+Expected possible human arrangement:
+
+```text
+strong player
+vs
+other two humans
+```
+
+Bots should then redistribute based on the selected logical human partition.
+
+The plugin should not use stale human `Team` properties from the same frame to calculate bot requirements.
 
 ---
 
-# 37. Backup Before Updating
+# 43. Extreme Low-Pop Test
 
-Before replacing a working build, back up:
+Test up to six humans.
 
-```text
-WarcraftAutoBalance.dll
-balance_data.json
-Warcraft configuration
-Warcraft player database/data
-```
+Construct a scenario where one player has substantially higher effective power.
 
-The most important balancer file is:
+Possible valid result:
 
 ```text
-balance_data.json
+1v5
 ```
 
-That contains accumulated learning.
+The plugin should choose this only if the nonlinear power model says it is the closest human-strength partition.
 
-Do not discard it between plugin updates unless intentionally resetting player/race learning.
+Do not expect 1v5 merely because one player has the highest rating.
+
+The combined opposing effective power still matters.
 
 ---
 
-# 38. Updating WarcraftAutoBalance Later
+# 44. Low-Pop Bot Availability Test
 
-Typical update process:
+Test asymmetric human arrangements with different bot counts:
 
 ```text
-1. Stop server or use controlled hot reload.
-2. Back up balance_data.json.
-3. Replace WarcraftAutoBalance DLL/output files.
-4. Do NOT delete balance_data.json.
-5. Start/reload plugin.
-6. Check console for JSON migration/deserialization errors.
-7. Run !balance.
+1v5 humans + 0 bots
+1v5 humans + 2 bots
+1v5 humans + 7 bots
+2v4 humans + 3 bots
 ```
 
-If the persistent data model changes significantly in a future version, migration logic may be necessary.
+The bot redistribution algorithm should choose the physical distribution that minimizes final physical team-count difference using only the bots that actually exist.
+
+It should not repeatedly select the same bot during one pass.
 
 ---
 
-# 39. Recommended Production Improvements After Initial Testing
+# 45. Emergency Disconnect Test: 10v10 → 10v8
 
-The current v2.4 is a strong baseline, but these are the next improvements worth considering.
-
-## A. Config file instead of constants
-
-Move values such as:
+Start:
 
 ```text
-BalanceEveryRounds
-MoveProtectionRounds
-BalanceTriggerWinChance
-TargetWinChance
-LowPopulationHumanThreshold
-LowPopulationPowerScale
-DisconnectRebalanceDelaySeconds
+10 vs 10
 ```
 
-into CounterStrikeSharp plugin configuration.
+Disconnect two players from the same team within approximately half a second.
 
-This lets admins tune them without recompiling.
-
-## B. Warcraft team-change callback
-
-Expose a callback/event so Warcraft can immediately clean up team-owned entities when the balancer moves someone.
-
-## C. Explicit Warcraft damage reporting
-
-Add shared API methods for custom ability/summon damage that CS2 does not naturally attribute.
-
-## D. Pre-round team snapshots
-
-Snapshot team strength at round start so disconnects and late joins cannot distort race expected-win learning.
-
-## E. Warmup / halftime guards
-
-Add explicit match-state suppression once the exact server lifecycle is known.
-
-## F. Learned server normalization
-
-Eventually replace hard-coded assumptions like:
+Expected:
 
 ```text
-100 ADR ≈ 1000 rating
-1.0 K/D ≈ 1000 rating
-70% KAST ≈ 1000 rating
+one coalesced emergency evaluation
+→ physical count correction
+→ immediate post-correction strength evaluation
 ```
 
-with medians learned from this Warcraft server.
+Confirm the plugin does not wait four rounds.
 
 ---
 
-# 40. Important Integration Rule
+# 46. Emergency Disconnect Test: 10v10 → 10v6
 
-The main Warcraft mod remains the **source of truth** for:
+Disconnect four players from one side quickly.
 
-```text
-current race
-current race level
-maximum race level
-Warcraft abilities
-Warcraft-owned entities
-```
-
-WarcraftAutoBalance remains the **source of truth** for:
-
-```text
-player balance rating
-recent performance window
-persistent historical rating
-learned race-strength modifier
-team-balance decisions
-low-pop partitions
-disconnect emergency corrections
-```
-
-Do not duplicate Warcraft profile storage inside the balancer.
-
-The balancer only needs enough race information to understand the player's current combat context.
-
----
-
-# 41. Minimal Main-Mod Integration Checklist
-
-At minimum, the Warcraft mod must do these things:
-
-```text
-[ ] Reference WarcraftBalance.Contracts
-[ ] Declare PluginCapability<IWarcraftBalanceService>
-[ ] Use capability ID "warcraft:autobalance"
-[ ] Call SetPlayerRace after race selection
-[ ] Call SetPlayerRace after race-level changes
-[ ] Resync current race after profile load / plugin reload
-[ ] Call ClearPlayerRace when the player truly has no race
-[ ] Ensure Warcraft team-owned entities are cleaned up after team changes
-```
-
----
-
-# 42. Minimal Server Installation Checklist
-
-```text
-[ ] Metamod works
-[ ] CounterStrikeSharp works
-[ ] Main Warcraft mod works
-[ ] WarcraftBalance.Contracts.dll installed under shared/
-[ ] WarcraftAutoBalance compiled against the server's API version
-[ ] WarcraftAutoBalance output installed under plugins/WarcraftAutoBalance/
-[ ] Main Warcraft mod rebuilt with contract integration
-[ ] Server restarted
-[ ] WarcraftAutoBalance appears in console/plugin list
-[ ] Capability connection succeeds
-[ ] Race sync logs correctly
-[ ] balance_data.json appears
-[ ] !balance works for admins
-[ ] 4-round normal test passes
-[ ] Low-pop test passes
-[ ] Emergency disconnect test passes
-[ ] Warcraft entities clean up correctly after team changes
-```
-
----
-
-# 43. Troubleshooting
-
-## WarcraftAutoBalance does not load
-
-Check:
-
-```text
-CounterStrikeSharp API mismatch
-missing dependency
-incorrect folder name
-incorrect DLL location
-.NET/runtime issue
-```
-
-Read the complete server-console exception.
-
-Do not troubleshoot only from the final error line.
-
-## `BalanceCapability.Get()` returns null
-
-Check:
-
-```text
-WarcraftAutoBalance loaded successfully
-contract DLL exists in shared/
-provider registered capability
-consumer uses same capability string
-both plugins use the same interface assembly
-```
-
-Both must use exactly:
-
-```text
-warcraft:autobalance
-```
-
-## `!balance` is unknown
-
-Check:
-
-```text
-WarcraftAutoBalance actually loaded
-CounterStrikeSharp chat trigger configuration
-css_balance exists
-admin permissions
-```
-
-Try from server console:
-
-```text
-css_balance
-```
-
-## `!balance` says permission denied
-
-The command currently requires:
-
-```text
-@css/generic
-```
-
-Ensure the admin account has the appropriate CounterStrikeSharp permissions.
-
-## Race always shows None / Neutral
-
-The Warcraft mod is not syncing race assignment.
+This tests multiple emergency moves.
 
 Verify:
 
-```csharp
-BalanceCapability.Get()?.SetPlayerRace(...)
-```
-
-actually runs after the player profile/race loads.
-
-## Race modifier stays 1.000
-
-This is normal initially.
-
-The race learner requires a sample before moving away from neutral.
-
-Current minimum:
-
 ```text
-40 race-round samples
+each selected bot/human is logically removed from source
+each is logically added to destination
+the same bot is not selected repeatedly
 ```
 
-It also deliberately shrinks small samples toward 1.000.
-
-## Players are being moved but Warcraft summons remain on old team
-
-That is a Warcraft integration issue, not a rating issue.
-
-Wire team-switch cleanup into the main mod.
-
-## Plugin loses ratings after restart
-
-Check:
-
-```text
-balance_data.json exists
-plugin directory is writable
-JSON is not corrupted
-server user has filesystem permissions
-```
-
-## Custom spell damage is missing
-
-Inspect whether `EventPlayerHurt.Attacker` identifies the owning player.
-
-If not, add explicit custom-damage reporting through the shared API.
+The final emergency logical counts should be correct even if engine-side `Team` state updates one frame later.
 
 ---
 
-# 44. Final Recommended Architecture
+# 47. Uneven Round-Start Expectation Test
+
+Start a real round at:
 
 ```text
-                      ┌─────────────────────┐
-                      │    Main Warcraft    │
-                      │        Mod          │
-                      └─────────┬───────────┘
-                                │
-                                │ current race
-                                │ race level
-                                │ max level
-                                ▼
-                  ┌──────────────────────────┐
-                  │ IWarcraftBalanceService  │
-                  │   PluginCapability API   │
-                  └────────────┬─────────────┘
-                               │
-                               ▼
-                 ┌────────────────────────────┐
-                 │   WarcraftAutoBalance      │
-                 │                            │
-                 │ Recent performance         │
-                 │ Historical rating          │
-                 │ Race learning              │
-                 │ Low-pop power              │
-                 │ Emergency balance          │
-                 │ Team swap selection        │
-                 └─────────────┬──────────────┘
-                               │
-                               │ SwitchTeam
-                               ▼
-                         ┌─────────────┐
-                         │     CS2     │
-                         │   T / CT    │
-                         └─────────────┘
+5 humans vs 4 humans
 ```
 
-This keeps the two systems separated cleanly:
+with approximately equal average player ratings.
 
-- Warcraft owns Warcraft.
-- The balancer owns balancing.
-- The shared contract is the small bridge between them.
+The expected win probability should no longer be approximately 50/50.
+
+The five-human side receives the configured numerical-strength adjustment.
+
+Then test:
+
+```text
+4 elite humans
+vs
+5 weak humans
+```
+
+The count adjustment should supplement player skill rather than replace it.
+
+---
+
+# 48. Disconnect During Round Test
+
+Because race expectation is frozen at round start:
+
+```text
+5v5 begins
+→ expectation captured
+→ one player disconnects mid-round
+```
+
+The race-learning expected probability for that already-started round remains based on the round-start state.
+
+This avoids retroactively changing the baseline after the outcome is already in progress.
+
+The emergency balancer can still correct the live team population separately.
+
+---
+
+# 49. Warmup, Restart, Halftime, and Map Transition Testing
+
+Before production deployment, explicitly test:
+
+```text
+warmup rounds
+mp_restartgame
+map changes
+halftime/team swaps if applicable
+plugin hot reload
+Warcraft mod hot reload
+```
+
+Watch for:
+
+```text
+false round-stat snapshots
+unexpected race-learning rounds
+balance calls during noncompetitive transitions
+team-owned Warcraft entities surviving team switches
+```
+
+If the server's exact game mode produces false learning during warmup/halftime, add explicit game-rules suppression before production.
+
+This remains an environment-specific hardening area.
+
+---
+
+# 50. Custom Damage Attribution
+
+The current direct stat model relies on CS2 game events.
+
+For normal player weapon damage this is appropriate.
+
+For custom Warcraft abilities, determine how the main mod reports:
+
+```text
+ability damage
+summon damage
+projectile damage
+damage-over-time
+reflected damage
+clone damage
+```
+
+If the resulting `EventPlayerHurt.Attacker` is the owning human, the existing system can count it.
+
+If the attacker is:
+
+```text
+world
+summon entity
+NPC
+projectile controller
+another synthetic entity
+```
+
+the standalone balancer cannot reliably infer ownership.
+
+Do not guess.
+
+The preferred future design is an explicit owner-attribution API.
+
+---
+
+# 51. Recommended Future Combat Attribution API
+
+A future contract could add methods similar to:
+
+```csharp
+void RecordOwnedDamage(
+    ulong ownerSteamId,
+    ulong victimSteamId,
+    int damage);
+
+void RecordOwnedKill(
+    ulong ownerSteamId,
+    ulong victimSteamId);
+
+void RecordOwnedAssist(
+    ulong ownerSteamId,
+    ulong victimSteamId);
+```
+
+The exact interface should be designed around the Warcraft mod's existing combat pipeline.
+
+The main rule is:
+
+```text
+Warcraft mod knows ability ownership
+→ Warcraft mod reports ownership
+→ AutoBalance records statistics
+```
+
+rather than:
+
+```text
+AutoBalance guesses entity ownership
+```
+
+---
+
+# 52. Team-Change Callback — Recommended Future Integration
+
+Similarly, the Warcraft mod knows which entities belong to a player.
+
+A future shared contract/event can communicate:
+
+```text
+AutoBalance moved player
+old team
+new team
+```
+
+The Warcraft mod can then clean or retarget:
+
+```text
+summons
+clones
+portals
+traps
+auras
+projectiles
+```
+
+This is safer than AutoBalance attempting to understand every race implementation.
+
+---
+
+# 53. JSON Validation
+
+After several rounds, inspect:
+
+```text
+balance_data.json
+```
+
+Confirm:
+
+```text
+SteamID64 records persist
+names update
+historical ratings change gradually
+recent round history remains bounded
+race rounds increase
+actual race wins increase correctly
+expected race wins are fractional
+learned modifiers remain within configured bounds
+```
+
+Do not manually edit the live JSON while the plugin is actively running unless you understand when the plugin will next overwrite it.
+
+---
+
+# 54. Backup Strategy
+
+At minimum, back up:
+
+```text
+balance_data.json
+```
+
+before:
+
+```text
+major rating formula changes
+race modifier formula changes
+season resets
+large plugin upgrades
+manual data edits
+```
+
+A simple dated copy is sufficient:
+
+```text
+balance_data_2026-08-30.json
+```
+
+---
+
+# 55. When to Move From JSON to SQLite
+
+JSON + in-memory dictionaries is appropriate now.
+
+Consider SQLite later if you want:
+
+```text
+large historical datasets
+per-season history
+detailed per-race analytics
+admin dashboards
+top-player queries
+long-term round history
+multiple reporting tools
+```
+
+SQLite itself is free and supports automated reads/writes.
+
+If migrating, keep the same runtime architecture:
+
+```text
+SQLite
+→ load active/persistent state
+→ RAM dictionaries during gameplay
+→ batched database writes
+```
+
+Do not execute synchronous SQL on every `player_hurt` event.
+
+A SteamID64 player table can use:
+
+```sql
+CREATE TABLE Players (
+    SteamId INTEGER PRIMARY KEY,
+    Name TEXT NOT NULL,
+    HistoricalRating REAL NOT NULL,
+    LifetimeRounds INTEGER NOT NULL DEFAULT 0,
+    LifetimeWins INTEGER NOT NULL DEFAULT 0
+);
+```
+
+`SteamId INTEGER PRIMARY KEY` is already indexed by SQLite.
+
+---
+
+# 56. Performance Guidelines
+
+Keep high-frequency event handlers cheap.
+
+Good:
+
+```text
+dictionary lookup
+integer increment
+small state update
+```
+
+Avoid:
+
+```text
+disk writes per hit
+SQL query per hit
+large LINQ scans per hit
+network requests per hit
+race-wide entity scans per hit
+```
+
+More expensive balance calculations occur only occasionally:
+
+```text
+every four rounds
+low-pop rebalance
+emergency disconnect correction
+admin diagnostics
+```
+
+For typical community-server populations, evaluating all T/CT single-swap pairs is trivial.
+
+Example:
+
+```text
+15 T × 15 CT = 225 candidate swaps
+```
+
+every four rounds is negligible compared with normal CS2 simulation and Warcraft entity processing.
+
+---
+
+# 57. Production Configuration Checklist
+
+Before going live:
+
+- [ ] Metamod loads correctly.
+- [ ] CounterStrikeSharp loads correctly.
+- [ ] Main Warcraft mod loads correctly.
+- [ ] WarcraftAutoBalance builds against the server's exact CounterStrikeSharp API.
+- [ ] Shared contracts assembly is identical for both plugins.
+- [ ] Capability ID is exactly `warcraft:autobalance`.
+- [ ] Race selection calls `SetPlayerRace()`.
+- [ ] Race level changes call `SetPlayerRace()`.
+- [ ] Temporary summon/respawn forms do **not** overwrite base race.
+- [ ] True no-race state calls `ClearPlayerRace()`.
+- [ ] `mp_autoteambalance 0`.
+- [ ] `mp_limitteams 0`.
+- [ ] `!balance` is admin-only.
+- [ ] `balance_data.json` is writable.
+- [ ] SteamID64 persistence has been tested.
+- [ ] Bot kills do not affect human rating.
+- [ ] Respawned players do not regain survival credit.
+- [ ] Low-pop 1v2/1v3/1v4/1v5 tests have been performed.
+- [ ] 10v10 → 10v8 emergency test passes.
+- [ ] 10v10 → 10v6 multi-move test passes.
+- [ ] Warcraft summons/clones are cleaned or retargeted on team movement.
+- [ ] Warmup/restart/halftime behavior has been tested.
+- [ ] Hot-reload race resynchronization has been tested.
+- [ ] Persistent data is backed up before production rollout.
+
+---
+
+# 58. Recommended Integration Responsibility Split
+
+## Main Warcraft Mod owns
+
+```text
+selected/base race
+race level
+race abilities
+respawns
+summon ownership
+projectile ownership
+clones
+portals
+traps
+auras
+race-specific cleanup
+```
+
+## WarcraftAutoBalance owns
+
+```text
+SteamID64 player ratings
+recent performance window
+historical skill
+race performance learning
+race modifiers
+team-strength calculations
+low-pop human partitioning
+bot redistribution
+emergency disconnect correction
+balance diagnostics
+persistent balance data
+```
+
+This separation is important.
+
+The balancer should understand **strength and teams**.
+
+The Warcraft mod should understand **race mechanics and entity ownership**.
+
+---
+
+# 59. Recommended Rollout Order
+
+Do not enable every behavior at once on a populated live server.
+
+Recommended order:
+
+### Phase 1 — Data only
+
+Install the plugin and race integration.
+
+Verify:
+
+```text
+player ratings
+race assignments
+JSON persistence
+diagnostics
+respawn statistics
+```
+
+### Phase 2 — Controlled low-pop test
+
+Use admins/testers.
+
+Verify:
+
+```text
+1v2
+1v3
+bot redistribution
+race changes
+respawns
+summon transformations
+```
+
+### Phase 3 — Emergency population tests
+
+Verify:
+
+```text
+10v10 → 10v8
+10v10 → 10v6
+multiple simultaneous disconnects
+```
+
+### Phase 4 — Normal automatic balancing
+
+Enable/test the four-round production behavior with a larger group.
+
+Watch:
+
+```text
+frequency of moves
+predicted win percentages
+player complaints
+race modifier movement
+unexpected Warcraft entity behavior
+```
+
+### Phase 5 — Tune from actual server data
+
+After enough real rounds, review:
+
+```text
+race modifier distribution
+historical rating distribution
+low-pop outcomes
+58/42 trigger frequency
+75-point population adjustment
+300 low-pop power scale
+```
+
+Tune only after collecting enough data to see a real pattern.
+
+---
+
+# 60. Current Default Values
+
+| Setting | v2.7 Default |
+|---|---:|
+| Scheduled balance interval | 4 rounds |
+| Recent performance window | 12 rounds |
+| Normal balance trigger | 58/42 |
+| Preferred post-balance target | 55/45 |
+| Low-pop threshold | 6 humans |
+| Low-pop power scale | 300 |
+| Emergency disconnect delay | 0.50 sec |
+| Emergency physical count difference | 2 |
+| New historical rating | 1000 |
+| Historical learning rate | 5% |
+| Race minimum sample | 40 rounds |
+| Race modifier range | 0.95–1.05 |
+| Race-level modifier range | 0.98–1.02 |
+| Uneven-human expectation adjustment | 75 rating / extra human |
+| Swap protection | None |
+
+---
+
+# 61. Final Architecture
+
+The intended production flow is:
+
+```text
+Player connects
+        ↓
+Warcraft profile loads
+        ↓
+Main mod determines base race + level
+        ↓
+SetPlayerRace()
+        ↓
+Round starts
+        ↓
+Human/race/team snapshot
+        ↓
+Pre-round expected win probability frozen
+        ↓
+Cheap combat/objective event collection
+        ↓
+Round ends
+        ↓
+Recent + historical player rating update
+        ↓
+Race actual-vs-expected learning
+        ↓
+Every 4 rounds:
+normal balance evaluation
+```
+
+For low population:
+
+```text
+2–6 humans
+        ↓
+calculate nonlinear human power
+        ↓
+evaluate every human partition
+        ↓
+choose closest power split
+        ↓
+switch humans
+        ↓
+use known logical human counts
+        ↓
+redistribute existing bots
+```
+
+For disconnect emergencies:
+
+```text
+disconnect(s)
+        ↓
+0.50 sec coalescing window
+        ↓
+physical count difference >= 2?
+        ↓
+yes
+        ↓
+logical emergency T/CT state
+        ↓
+move bot if possible
+otherwise choose rating-aware human
+        ↓
+repeat until physical difference <= 1
+        ↓
+next frame
+        ↓
+normal 58/42 strength check
+```
+
+For Warcraft respawns:
+
+```text
+base race selected
+        ↓
+player dies
+        ↓
+Died = true
+        ↓
+race respawns player / summon form
+        ↓
+base race assignment remains unchanged
+        ↓
+survival credit remains false
+        ↓
+race receives long-term outcome attribution
+```
+
+That is the intended v2.7 implementation model.
