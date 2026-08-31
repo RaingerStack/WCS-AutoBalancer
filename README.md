@@ -1,4 +1,4 @@
-# WarcraftAutoBalance v2.11 — Full Implementation Guide
+# WarcraftAutoBalance v2.12 — Full Implementation Guide
 
 ## 1. Purpose
 
@@ -360,21 +360,92 @@ KAST .............. 10%
 Objective impact .. 10%
 ```
 
-Reference normalization:
+### Warcraft-scale ADR and K/D
+
+Warcraft gameplay can legitimately create several hundred ADR and K/D values
+well above conventional Counter-Strike ranges.
+
+ADR and K/D therefore use an inexpensive logarithmic diminishing-return
+transform instead of a simple linear scale with a low ceiling.
+
+Reference points:
 
 ```text
-100 ADR   ≈ 1000
-1.0 K/D   ≈ 1000
-70% KAST  ≈ 1000
-0.15 objective points/round ≈ 1000
+ADR reference .... 100
+K/D reference .... 1.0
 ```
 
-Component clamps prevent extreme small-sample values from dominating.
+At the reference point the component rating is 1000. Above the reference,
+component rating continues to rise but with diminishing returns.
 
-Players with fewer than 12 rounds use only the real rounds available.
+Approximate raw transform behavior:
 
-`MinimumRoundsForRecentStats` prevents extremely tiny samples from being treated
-as fully established recent performance.
+```text
+ADR       component rating
+  50      ~743
+ 100      1000
+ 200      ~1347
+ 400      ~1693
+ 800      ~2040
+1200      ~2242
+
+K/D       component rating
+ 0.5      ~774
+ 1.0      1000
+ 2.0      ~1291
+ 5.0      ~1676
+10.0      ~1967
+25.0      ~2352
+50.0      ~2600 safety ceiling
+```
+
+This means 5, 15, and 25 K/D remain meaningfully different while a single
+extreme stat cannot scale linearly without limit and dominate the complete
+balance score.
+
+### Small-sample K/D smoothing
+
+K/D is calculated from aggregate kills and deaths in the real recent-round
+window with a small Bayesian-style prior:
+
+```text
+effective K/D = (kills + 3) / (deaths + 3)
+```
+
+Examples:
+
+```text
+10-0   -> 4.33 effective K/D
+25-0   -> 9.33 effective K/D
+100-4  -> 14.71 effective K/D
+250-10 -> 19.46 effective K/D
+```
+
+A brand-new flawless streak therefore receives strong credit without being
+treated identically to sustained elite performance over a much larger sample.
+As real engagements accumulate, the 3/3 prior becomes increasingly insignificant.
+
+### Safety bounds and performance cost
+
+ADR and K/D component ratings have only a wide emergency range:
+
+```text
+450 .. 2600
+```
+
+The logarithmic transform provides normal differentiation; the bounds are
+primarily protection against pathological values.
+
+The implementation adds only a `Math.Log` and a few arithmetic operations per
+ADR/KD component when a player rating is evaluated. It adds no database work and
+no computation to damage, death, assist, objective, or other high-frequency
+combat events.
+
+The exact same normalization is used by both the current player rating and the
+historical-rating learning calculation, so the two systems cannot drift apart.
+
+Players with fewer than 12 rounds use only the real rounds available. Missing
+rounds never exist and never contribute zeros.
 
 ---
 
