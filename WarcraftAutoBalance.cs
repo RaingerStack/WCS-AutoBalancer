@@ -16,7 +16,7 @@ using Microsoft.Data.Sqlite;
 public class WarcraftAutoBalancePlugin : BasePlugin
 {
     public override string ModuleName => "Warcraft Auto Balance";
-    public override string ModuleVersion => "2.14.0";
+    public override string ModuleVersion => "2.15.0";
     public override string ModuleAuthor => "YourName";
     public override string ModuleDescription =>
         "Persistent, self-learning team balancing for Warcraft CS2.";
@@ -510,49 +510,30 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         EventRoundPrestart @event,
         GameEventInfo info)
     {
-        if (_initialLiveBalanceCompleted)
+        if (IsWarmupActive())
             return HookResult.Continue;
 
-        // round_prestart also fires during warmup. The GameRules proxy
-        // is the authoritative guard. If it is temporarily unavailable,
-        // only proceed if we have positively observed warmup_end.
-        if (TryGetGameRules(out CCSGameRules? rules) &&
-            rules != null)
+        // First live prestart on the map: perform the full initial balance.
+        // Do not return afterward; a disconnect may also have set an
+        // emergency-balance flag before this same prestart.
+        if (!_initialLiveBalanceCompleted)
         {
-            if (rules.WarmupPeriod)
-                return HookResult.Continue;
-        }
-        else if (!_warmupEndedObserved)
-        {
-            if (!_gameRulesWarningLogged)
-            {
-                _gameRulesWarningLogged = true;
-
-                Logger.LogWarning(
-                    "[WarcraftBalance] GameRules unavailable during round_prestart; delaying initial balance rather than risking a warmup/live-state mistake.");
-            }
-
-            return HookResult.Continue;
+            ApplyInitialLiveBalance();
         }
 
-        // Set the guard BEFORE moving anyone. If a team-change side
-        // effect causes another event path, the initial pass cannot run
-        // twice.
-        _initialLiveBalanceCompleted = true;
-
-        ApplyInitialLiveBalance();
-
-        // Disconnect-driven balancing is executed only here, between rounds.
-        // Recalculate from CURRENT population/race/rating state instead of
-        // executing a swap chosen earlier in the live round.
+        // All disconnect-driven move selection AND execution happens here,
+        // during the safe prestart window. Nothing in the disconnect path
+        // calls SwitchTeam() during an active/live round.
         if (_emergencyBalancePendingForNextPrestart)
         {
             _emergencyBalancePendingForNextPrestart = false;
 
+            // Recalculate from CURRENT players, teams, races, levels, and
+            // ratings so we never execute a stale move chosen mid-round.
             EvaluateEmergencyPopulationBalance();
 
-            // Re-check normal team strength immediately after population
-            // correction while still in the safe prestart window.
+            // Re-check normal team strength immediately after the emergency
+            // population correction, still before normal spawning.
             EvaluateTeamBalance();
         }
 
@@ -2190,7 +2171,7 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             return;
 
         Server.PrintToChatAll(
-            " \x04[Balance]\x01 Teams immediately corrected after disconnects.");
+            " \x04[Balance]\x01 Teams corrected for the next round after disconnects.");
 
         Logger.LogInformation(
             "[WarcraftBalance] Emergency disconnect balance moved {Moves} player(s). Final logical count T {TCount} vs CT {CTCount}.",
