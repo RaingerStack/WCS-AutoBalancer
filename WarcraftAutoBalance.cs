@@ -16,7 +16,7 @@ using Microsoft.Data.Sqlite;
 public class WarcraftAutoBalancePlugin : BasePlugin
 {
     public override string ModuleName => "Warcraft Auto Balance";
-    public override string ModuleVersion => "2.12.0";
+    public override string ModuleVersion => "2.13.0";
     public override string ModuleAuthor => "YourName";
     public override string ModuleDescription =>
         "Persistent, self-learning team balancing for Warcraft CS2.";
@@ -53,7 +53,9 @@ public class WarcraftAutoBalancePlugin : BasePlugin
     //
     // Lower values make elite-vs-many splits more likely.
     // Higher values make the curve more conservative.
-    private const double LowPopulationPowerScale = 300.0;
+    private const double LowPopulationPowerScale = 600.0;
+    private const double MinimumLowPopulationPower = 0.20;
+    private const double MaximumLowPopulationPower = 8.00;
 
     // ============================================================
     // EMERGENCY POPULATION REBALANCE
@@ -2630,13 +2632,16 @@ public class WarcraftAutoBalancePlugin : BasePlugin
     private static double CalculateLowPopulationPower(
         double finalRating)
     {
-        // Exponential curve makes differences at the high end matter
-        // much more than raw additive rating.
-        //
-        // This is intentionally only used in low-pop partitioning.
-        return Math.Exp(
-            (finalRating - DefaultHistoricalRating) /
-            LowPopulationPowerScale
+        double power =
+            Math.Exp(
+                (finalRating - DefaultHistoricalRating) /
+                LowPopulationPowerScale
+            );
+
+        return Math.Clamp(
+            power,
+            MinimumLowPopulationPower,
+            MaximumLowPopulationPower
         );
     }
 
