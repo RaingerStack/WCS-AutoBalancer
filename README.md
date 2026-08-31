@@ -1,4 +1,4 @@
-# WarcraftAutoBalance v2.12 — Full Implementation Guide
+# WarcraftAutoBalance v2.13 — Full Implementation Guide
 
 ## 1. Purpose
 
@@ -680,26 +680,59 @@ The goal is effective human power, not equal human count.
 
 ## 24. Low-Population Effective Power
 
-Low-pop balance uses nonlinear power:
+Low-pop balance uses a nonlinear effective-power conversion:
 
 ```csharp
-Math.Exp(
-    (finalRating - 1000) /
-    300.0);
+double power =
+    Math.Exp(
+        (finalRating - 1000) /
+        600.0);
+
+power =
+    Math.Clamp(
+        power,
+        0.20,
+        8.00);
 ```
 
-Examples:
+Approximate behavior:
 
 ```text
-1000 rating → 1.00 power
-1300 rating → 2.72 power
-1600 rating → 7.39 power
+Final Rating    Effective Power
+1000            1.00
+1300            1.65
+1600            2.72
+1900            4.48
+2200            7.39
+2500            8.00 capped
 ```
 
-This allows a legitimately exceptional player/race combination to be matched
-against multiple weaker humans.
+The 600-point scale is intentionally softer than the older 300-point scale. The
+v2.12 ADR/K/D changes widened the legitimate player-rating range, so the older
+curve would have exaggerated elite ratings into unrealistic 20x, 50x, or 100x
+low-pop power values.
 
-For 2–6 humans, every valid non-empty partition can be evaluated cheaply.
+The nonlinear model is still preserved because low-pop should be able to create
+layouts such as:
+
+```text
+1v2
+1v3
+1v4
+1v5
+2v3
+2v4
+```
+
+when the available player-strength distribution justifies them.
+
+The `0.20–8.00` clamp is a safety boundary, not the normal source of
+differentiation. In a mode containing at most six humans, distinguishing an 8x
+player from a theoretical 20x or 100x player has no practical team-partition
+value and can make the optimization unstable.
+
+For 2–6 humans, every valid non-empty partition remains cheap to evaluate
+exhaustively.
 
 ---
 
@@ -1161,7 +1194,9 @@ MaximumRaceModifier ................ 1.05
 MinimumLevelModifier ............... 0.98
 MaximumLevelModifier ............... 1.02
 
-LowPopulationPowerScale ............ 300
+LowPopulationPowerScale ............ 600
+MinimumLowPopulationPower .......... 0.20
+MaximumLowPopulationPower .......... 8.00
 PlayerCountExpectationAdjustment ... 75
 
 DisconnectRebalanceDelaySeconds .... 0.50
