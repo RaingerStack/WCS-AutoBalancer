@@ -1,4 +1,4 @@
-# WarcraftAutoBalance v2.13 — Full Implementation Guide
+# WarcraftAutoBalance v2.14 — Full Implementation Guide
 
 ## 1. Purpose
 
@@ -817,24 +817,52 @@ Every player is therefore eligible at every balance pass.
 
 ## 29. Immediate Disconnect Handling
 
-Disconnects can create urgent physical imbalance before the normal four-round
-schedule.
+Disconnects are detected immediately, but team changes are never executed during
+the live round.
 
-Disconnect events are coalesced with a short delay so multiple near-simultaneous
-leaves become one evaluation.
-
-Example:
+When a human disconnects:
 
 ```text
-10v10
-→ player leaves
-→ another leaves immediately
-→ one delayed evaluation sees 10v8
+disconnect event
+→ persist departing player
+→ evict departing player from active RAM
+→ set emergency-balance-pending flag
+→ current round continues normally
 ```
 
-A physical team-count difference of two or more triggers emergency correction.
+There is no disconnect rebalance timer and no mid-round `SwitchTeam()`.
 
-After population correction, normal strength evaluation is run again.
+At the next live `round_prestart`:
+
+```text
+read CURRENT humans
+→ read CURRENT team membership
+→ use CURRENT race/level/rating state
+→ run emergency population correction if still required
+→ run normal strength evaluation
+→ perform any SwitchTeam() changes before normal spawning
+→ CS2 continues normal round reset/spawn
+```
+
+The plugin deliberately does not store a specific swap at disconnect time. A
+player may join, leave, select another race, or change level before the current
+round ends. Recalculating at prestart prevents stale decisions.
+
+Multiple disconnects naturally collapse into the same pending flag.
+
+This provides the same pawn-safety principle used by the Round-1 initial balance:
+
+- no active pawn changes team during combat;
+- no manual respawn;
+- no suicide/slay;
+- no spawn teleport;
+- no pawn left physically on the prior side;
+- Warcraft death/respawn systems are not deliberately triggered;
+- players spawn normally for their corrected teams on the next round.
+
+The emergency physical-count threshold remains a team difference of two or more.
+When 2–6 humans are present, adaptive low-population partitioning remains
+available.
 
 ---
 
@@ -1199,7 +1227,6 @@ MinimumLowPopulationPower .......... 0.20
 MaximumLowPopulationPower .......... 8.00
 PlayerCountExpectationAdjustment ... 75
 
-DisconnectRebalanceDelaySeconds .... 0.50
 EmergencyTeamCountDifference ....... 2
 ```
 
