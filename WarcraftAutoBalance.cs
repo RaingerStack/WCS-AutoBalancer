@@ -16,7 +16,7 @@ using Microsoft.Data.Sqlite;
 public class WarcraftAutoBalancePlugin : BasePlugin
 {
     public override string ModuleName => "Warcraft Auto Balance";
-    public override string ModuleVersion => "2.11.0";
+    public override string ModuleVersion => "2.12.0";
     public override string ModuleAuthor => "YourName";
     public override string ModuleDescription =>
         "Persistent, self-learning team balancing for Warcraft CS2.";
@@ -87,6 +87,23 @@ public class WarcraftAutoBalancePlugin : BasePlugin
     private const double HistoricalWeight = 0.20;
     private const double KastWeight = 0.10;
     private const double ObjectiveWeight = 0.10;
+
+    // Warcraft-scale ADR/KD normalization. These calculations run only
+    // when ratings are evaluated, never in high-frequency combat hooks.
+    private const double AdrReference = 100.0;
+    private const double AdrLogSensitivity = 0.50;
+    private const double KdReference = 1.0;
+    private const double KdLogSensitivity = 0.42;
+
+    // Small Bayesian-style prior for K/D. This reduces tiny-sample
+    // 10-0 / 25-0 spikes while rapidly fading as real engagements grow.
+    private const double KdPriorKills = 3.0;
+    private const double KdPriorDeaths = 3.0;
+
+    // Wide emergency bounds. Normal differentiation comes from the
+    // diminishing-return logarithmic curve rather than a low hard cap.
+    private const double MinimumRecentComponentRating = 450.0;
+    private const double MaximumRecentComponentRating = 2600.0;
 
     // ============================================================
     // AUTOMATIC RACE BALANCING CONFIG
@@ -1748,6 +1765,43 @@ public class WarcraftAutoBalancePlugin : BasePlugin
     // PLAYER RATING
     // ============================================================
 
+    private static double TransformExtremeStatToRating(
+        double value,
+        double reference,
+        double sensitivity)
+    {
+        if (!double.IsFinite(value) ||
+            value <= 0.0 ||
+            reference <= 0.0)
+        {
+            return MinimumRecentComponentRating;
+        }
+
+        double ratio =
+            value / reference;
+
+        double rating =
+            ratio >= 1.0
+                ? DefaultHistoricalRating *
+                  (
+                      1.0 +
+                      sensitivity *
+                      Math.Log(ratio)
+                  )
+                : DefaultHistoricalRating /
+                  (
+                      1.0 +
+                      sensitivity *
+                      Math.Log(1.0 / ratio)
+                  );
+
+        return Math.Clamp(
+            rating,
+            MinimumRecentComponentRating,
+            MaximumRecentComponentRating
+        );
+    }
+
     private RatingBreakdown GetRatingBreakdown(
         CCSPlayerController player)
     {
@@ -1789,8 +1843,8 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             rounds.Sum(x => x.Deaths);
 
         double kd =
-            kills /
-            Math.Max(1.0, deaths);
+            (kills + KdPriorKills) /
+            (deaths + KdPriorDeaths);
 
         double kast =
             rounds.Count(x => x.Contributed) /
@@ -1801,19 +1855,17 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             count;
 
         double adrRating =
-            1000.0 *
-            Math.Clamp(
-                adr / 100.0,
-                0.40,
-                1.60
+            TransformExtremeStatToRating(
+                adr,
+                AdrReference,
+                AdrLogSensitivity
             );
 
         double kdRating =
-            1000.0 *
-            Math.Clamp(
+            TransformExtremeStatToRating(
                 kd,
-                0.40,
-                1.60
+                KdReference,
+                KdLogSensitivity
             );
 
         double kastRating =
@@ -1922,12 +1974,15 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             rounds.Sum(x => x.Damage) /
             count;
 
+        double totalKills =
+            rounds.Sum(x => x.Kills);
+
+        double totalDeaths =
+            rounds.Sum(x => x.Deaths);
+
         double kd =
-            rounds.Sum(x => x.Kills) /
-            Math.Max(
-                1.0,
-                rounds.Sum(x => x.Deaths)
-            );
+            (totalKills + KdPriorKills) /
+            (totalDeaths + KdPriorDeaths);
 
         double kast =
             rounds.Count(x => x.Contributed) /
@@ -1938,19 +1993,17 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             count;
 
         double adrRating =
-            1000 *
-            Math.Clamp(
-                adr / 100.0,
-                0.40,
-                1.60
+            TransformExtremeStatToRating(
+                adr,
+                AdrReference,
+                AdrLogSensitivity
             );
 
         double kdRating =
-            1000 *
-            Math.Clamp(
+            TransformExtremeStatToRating(
                 kd,
-                0.40,
-                1.60
+                KdReference,
+                KdLogSensitivity
             );
 
         double kastRating =
