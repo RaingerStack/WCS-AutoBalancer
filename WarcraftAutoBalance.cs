@@ -2,8 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text.Json;
-
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes;
@@ -14,10 +12,11 @@ using CounterStrikeSharp.API.Modules.Utils;
 
 namespace WarcraftAutoBalance;
 
+using Microsoft.Data.Sqlite;
 public class WarcraftAutoBalancePlugin : BasePlugin
 {
     public override string ModuleName => "Warcraft Auto Balance";
-    public override string ModuleVersion => "2.8.0";
+    public override string ModuleVersion => "2.11.0";
     public override string ModuleAuthor => "YourName";
     public override string ModuleDescription =>
         "Persistent, self-learning team balancing for Warcraft CS2.";
@@ -141,11 +140,14 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         };
 
     // ============================================================
-    // PERSISTENCE
+    // SQLITE PERSISTENCE
     // ============================================================
 
-    private string DataFilePath =>
-        Path.Combine(ModuleDirectory, "balance_data.json");
+    private const int DatabaseSchemaVersion = 2;
+
+    private string DatabaseFilePath =>
+        Path.Combine(ModuleDirectory, "balance.db");
+    private SqliteConnection? _databaseConnection;
 
     // ============================================================
     // LOAD / UNLOAD
@@ -201,6 +203,23 @@ public class WarcraftAutoBalancePlugin : BasePlugin
     public override void Unload(bool hotReload)
     {
         SavePersistentData();
+
+        try
+        {
+            _databaseConnection?.Close();
+            _databaseConnection?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(
+                ex,
+                "[WarcraftBalance] Failed while closing SQLite."
+            );
+        }
+        finally
+        {
+            _databaseConnection = null;
+        }
     }
 
     // ============================================================
@@ -344,17 +363,28 @@ public class WarcraftAutoBalancePlugin : BasePlugin
                 player.SteamID,
                 out PlayerBalanceData? data))
         {
-            data = new PlayerBalanceData
-            {
-                SteamId = player.SteamID,
-                Name = player.PlayerName,
-                HistoricalRating = DefaultHistoricalRating
-            };
+            data =
+                LoadPlayerFromDatabase(
+                    player.SteamID)
+                ??
+                new PlayerBalanceData
+                {
+                    SteamId =
+                        player.SteamID,
 
-            _players[player.SteamID] = data;
+                    Name =
+                        player.PlayerName,
+
+                    HistoricalRating =
+                        DefaultHistoricalRating
+                };
+
+            _players[player.SteamID] =
+                data;
         }
 
-        data.Name = player.PlayerName;
+        data.Name =
+            player.PlayerName;
 
         return data;
     }
@@ -403,6 +433,30 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         EventPlayerDisconnect @event,
         GameEventInfo info)
     {
+        CCSPlayerController? player =
+            @event.Userid;
+
+        if (player != null &&
+            player.SteamID != 0 &&
+            _players.TryGetValue(
+                player.SteamID,
+                out PlayerBalanceData? data))
+        {
+            // Flush only this player's bounded persistent state, then
+            // evict it from RAM. Historical population can therefore
+            // grow without keeping every past player resident.
+            SaveSinglePlayerData(data);
+
+            _players.Remove(
+                player.SteamID);
+
+            _playerRaces.Remove(
+                player.SteamID);
+
+            _currentRound.Remove(
+                player.SteamID);
+        }
+
         QueueEmergencyPopulationRebalance();
         return HookResult.Continue;
     }
@@ -1405,9 +1459,14 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             _roundExpectation
         );
 
+        // SQLite persistence is committed once per completed round.
+        // This is deliberately outside all high-frequency combat
+        // handlers and limits hard-crash data loss to the current
+        // unfinished round.
+        SavePersistentData();
+
         if (_roundNumber % BalanceEveryRounds == 0)
         {
-            SavePersistentData();
             Server.NextFrame(EvaluateTeamBalance);
         }
 
@@ -1525,6 +1584,9 @@ public class WarcraftAutoBalancePlugin : BasePlugin
 
             RoundSnapshot snapshot = new()
             {
+                RoundId = _roundNumber,
+                PlayedUtc = DateTime.UtcNow.ToString("O"),
+                PendingPersistence = true,
                 Damage = round.Damage,
                 Kills = round.Kills,
                 Deaths = round.Deaths,
@@ -3055,7 +3117,7 @@ public class WarcraftAutoBalancePlugin : BasePlugin
     }
 
     // ============================================================
-    // JSON PERSISTENCE
+    // SQLITE PERSISTENCE
     // ============================================================
 
     private void LoadPersistentData()
@@ -3066,46 +3128,39 @@ public class WarcraftAutoBalancePlugin : BasePlugin
                 ModuleDirectory
             );
 
-            if (!File.Exists(DataFilePath))
-                return;
+            SqliteConnectionStringBuilder builder =
+                new()
+                {
+                    DataSource =
+                        DatabaseFilePath,
 
-            string json =
-                File.ReadAllText(
-                    DataFilePath
+                    Mode =
+                        SqliteOpenMode.ReadWriteCreate
+                };
+
+            _databaseConnection =
+                new SqliteConnection(
+                    builder.ToString()
                 );
 
-            PersistentState? state =
-                JsonSerializer.Deserialize<PersistentState>(
-                    json
-                );
+            _databaseConnection.Open();
 
-            if (state == null)
-                return;
+            ConfigureDatabase();
+            EnsureDatabaseSchema();
 
             _roundNumber =
-                state.RoundNumber;
+                LoadRoundNumber();
 
+            // Historical players are intentionally NOT loaded globally.
+            // They are lazy-loaded by SteamID64 when first needed.
             _players.Clear();
 
-            foreach (PlayerBalanceData player
-                     in state.Players)
-            {
-                _players[player.SteamId] =
-                    player;
-            }
-
-            _raceStats.Clear();
-
-            foreach (RacePerformanceData race
-                     in state.Races)
-            {
-                _raceStats[race.RaceName] =
-                    race;
-            }
+            LoadRaceStatsFromDatabase();
 
             Logger.LogInformation(
-                "[WarcraftBalance] Loaded {Players} player ratings and {Races} race profiles.",
-                _players.Count,
+                "[WarcraftBalance] SQLite ready at {Database}. " +
+                "{Races} race profiles loaded; historical players will lazy-load on demand.",
+                DatabaseFilePath,
                 _raceStats.Count
             );
         }
@@ -3113,87 +3168,986 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         {
             Logger.LogError(
                 ex,
-                "[WarcraftBalance] Failed to load balance_data.json."
+                "[WarcraftBalance] Failed to initialize SQLite persistence."
             );
         }
     }
 
-    private void SavePersistentData()
+    private void ConfigureDatabase()
     {
+        SqliteConnection connection =
+            RequireDatabaseConnection();
+
+        using SqliteCommand command =
+            connection.CreateCommand();
+
+        command.CommandText =
+            """
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA foreign_keys = ON;
+            PRAGMA busy_timeout = 5000;
+            """;
+
+        command.ExecuteNonQuery();
+    }
+
+    private void EnsureDatabaseSchema()
+    {
+        SqliteConnection connection =
+            RequireDatabaseConnection();
+
+        using SqliteTransaction transaction =
+            connection.BeginTransaction();
+
+        using SqliteCommand command =
+            connection.CreateCommand();
+
+        command.Transaction =
+            transaction;
+
+        command.CommandText =
+            """
+            CREATE TABLE IF NOT EXISTS Metadata (
+                Key TEXT PRIMARY KEY,
+                Value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS Players (
+                SteamId INTEGER PRIMARY KEY,
+                Name TEXT NOT NULL,
+                HistoricalRating REAL NOT NULL DEFAULT 1000,
+                LifetimeRounds INTEGER NOT NULL DEFAULT 0,
+                LifetimeWins INTEGER NOT NULL DEFAULT 0,
+                CreatedUtc TEXT NOT NULL,
+                LastSeenUtc TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS RecentRounds (
+                SteamId INTEGER NOT NULL,
+                RoundId INTEGER NOT NULL,
+                PlayedUtc TEXT NOT NULL,
+                Damage INTEGER NOT NULL,
+                Kills INTEGER NOT NULL,
+                Deaths INTEGER NOT NULL,
+                Assists INTEGER NOT NULL,
+                Survived INTEGER NOT NULL,
+                Contributed INTEGER NOT NULL,
+                TeamWon INTEGER NOT NULL,
+                ObjectivePoints REAL NOT NULL,
+                PRIMARY KEY (SteamId, RoundId),
+                FOREIGN KEY (SteamId)
+                    REFERENCES Players(SteamId)
+                    ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS RaceStats (
+                RaceName TEXT PRIMARY KEY COLLATE NOCASE,
+                RoundsPlayed INTEGER NOT NULL DEFAULT 0,
+                ActualWins REAL NOT NULL DEFAULT 0,
+                ExpectedWins REAL NOT NULL DEFAULT 0,
+                LastCalculatedModifier REAL NOT NULL DEFAULT 1.0
+            );
+
+            CREATE INDEX IF NOT EXISTS
+                IX_Players_LastSeenUtc
+            ON Players (LastSeenUtc);
+
+            CREATE INDEX IF NOT EXISTS
+                IX_RaceStats_RoundsPlayed
+            ON RaceStats (RoundsPlayed DESC);
+            """;
+
+        command.ExecuteNonQuery();
+
+        MigrateRecentRoundsSchemaIfNeeded(
+            transaction
+        );
+
+        using (SqliteCommand indexCommand =
+               connection.CreateCommand())
+        {
+            indexCommand.Transaction = transaction;
+            indexCommand.CommandText =
+                """
+                CREATE INDEX IF NOT EXISTS
+                    IX_RecentRounds_SteamId_RoundId
+                ON RecentRounds (
+                    SteamId,
+                    RoundId DESC
+                );
+                """;
+            indexCommand.ExecuteNonQuery();
+        }
+
+        SetMetadataValue(
+            "SchemaVersion",
+            DatabaseSchemaVersion.ToString(),
+            transaction
+        );
+
+        transaction.Commit();
+    }
+
+    private void MigrateRecentRoundsSchemaIfNeeded(
+        SqliteTransaction transaction)
+    {
+        SqliteConnection connection =
+            RequireDatabaseConnection();
+
+        bool hasSequence = false;
+        bool hasRoundId = false;
+        bool hasPlayedUtc = false;
+
+        using (SqliteCommand inspect =
+               connection.CreateCommand())
+        {
+            inspect.Transaction = transaction;
+            inspect.CommandText =
+                "PRAGMA table_info(RecentRounds);";
+
+            using SqliteDataReader reader =
+                inspect.ExecuteReader();
+
+            while (reader.Read())
+            {
+                string column =
+                    reader.GetString(1);
+
+                hasSequence |=
+                    string.Equals(
+                        column,
+                        "Sequence",
+                        StringComparison.OrdinalIgnoreCase);
+
+                hasRoundId |=
+                    string.Equals(
+                        column,
+                        "RoundId",
+                        StringComparison.OrdinalIgnoreCase);
+
+                hasPlayedUtc |=
+                    string.Equals(
+                        column,
+                        "PlayedUtc",
+                        StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        if (!hasSequence ||
+            (hasRoundId && hasPlayedUtc))
+        {
+            return;
+        }
+
+        // Upgrade support for the earlier SQLite v2.9 Sequence schema.
+        // Existing chronological order is preserved with negative IDs;
+        // all new live RoundIds are positive and sort newer.
+        using SqliteCommand migrate =
+            connection.CreateCommand();
+
+        migrate.Transaction = transaction;
+        migrate.CommandText =
+            """
+            ALTER TABLE RecentRounds
+            RENAME TO RecentRounds_v1;
+
+            CREATE TABLE RecentRounds (
+                SteamId INTEGER NOT NULL,
+                RoundId INTEGER NOT NULL,
+                PlayedUtc TEXT NOT NULL,
+                Damage INTEGER NOT NULL,
+                Kills INTEGER NOT NULL,
+                Deaths INTEGER NOT NULL,
+                Assists INTEGER NOT NULL,
+                Survived INTEGER NOT NULL,
+                Contributed INTEGER NOT NULL,
+                TeamWon INTEGER NOT NULL,
+                ObjectivePoints REAL NOT NULL,
+                PRIMARY KEY (SteamId, RoundId),
+                FOREIGN KEY (SteamId)
+                    REFERENCES Players(SteamId)
+                    ON DELETE CASCADE
+            );
+
+            INSERT INTO RecentRounds (
+                SteamId,
+                RoundId,
+                PlayedUtc,
+                Damage,
+                Kills,
+                Deaths,
+                Assists,
+                Survived,
+                Contributed,
+                TeamWon,
+                ObjectivePoints
+            )
+            SELECT
+                SteamId,
+                -1000000 + Sequence,
+                '',
+                Damage,
+                Kills,
+                Deaths,
+                Assists,
+                Survived,
+                Contributed,
+                TeamWon,
+                ObjectivePoints
+            FROM RecentRounds_v1;
+
+            DROP TABLE RecentRounds_v1;
+            """;
+
+        migrate.ExecuteNonQuery();
+
+        Logger.LogInformation(
+            "[WarcraftBalance] Migrated RecentRounds schema v1 -> v2."
+        );
+    }
+
+
+
+    private long GetDatabasePlayerCount()
+    {
+        SqliteConnection connection =
+            RequireDatabaseConnection();
+
+        using SqliteCommand command =
+            connection.CreateCommand();
+
+        command.CommandText =
+            "SELECT COUNT(*) FROM Players;";
+
+        object? value =
+            command.ExecuteScalar();
+
+        return value == null
+            ? 0
+            : Convert.ToInt64(value);
+    }
+
+    private void LoadRaceStatsFromDatabase()
+    {
+        _raceStats.Clear();
+
+        SqliteConnection connection =
+            RequireDatabaseConnection();
+
+        using SqliteCommand command =
+            connection.CreateCommand();
+
+        command.CommandText =
+            """
+            SELECT
+                RaceName,
+                RoundsPlayed,
+                ActualWins,
+                ExpectedWins,
+                LastCalculatedModifier
+            FROM RaceStats;
+            """;
+
+        using SqliteDataReader reader =
+            command.ExecuteReader();
+
+        while (reader.Read())
+        {
+            RacePerformanceData race =
+                new()
+                {
+                    RaceName =
+                        reader.GetString(0),
+
+                    RoundsPlayed =
+                        reader.GetInt32(1),
+
+                    ActualWins =
+                        reader.GetDouble(2),
+
+                    ExpectedWins =
+                        reader.GetDouble(3),
+
+                    LastCalculatedModifier =
+                        reader.GetDouble(4)
+                };
+
+            _raceStats[race.RaceName] =
+                race;
+        }
+    }
+
+    private PlayerBalanceData? LoadPlayerFromDatabase(
+        ulong steamId)
+    {
+        if (_databaseConnection == null)
+            return null;
+
         try
         {
-            Directory.CreateDirectory(
-                ModuleDirectory
+            SqliteConnection connection =
+                RequireDatabaseConnection();
+
+            using SqliteCommand command =
+                connection.CreateCommand();
+
+            command.CommandText =
+                """
+                SELECT
+                    Name,
+                    HistoricalRating,
+                    LifetimeRounds,
+                    LifetimeWins
+                FROM Players
+                WHERE SteamId = $steamId;
+                """;
+
+            command.Parameters.AddWithValue(
+                "$steamId",
+                SteamIdToInt64(steamId)
             );
 
-            PersistentState state =
+            using SqliteDataReader reader =
+                command.ExecuteReader();
+
+            if (!reader.Read())
+                return null;
+
+            PlayerBalanceData player =
                 new()
                 {
-                    RoundNumber =
-                        _roundNumber,
+                    SteamId =
+                        steamId,
 
-                    Players =
-                        _players.Values
-                            .ToList(),
+                    Name =
+                        reader.GetString(0),
 
-                    Races =
-                        _raceStats.Values
-                            .ToList()
+                    HistoricalRating =
+                        reader.GetDouble(1),
+
+                    LifetimeRounds =
+                        reader.GetInt32(2),
+
+                    LifetimeWins =
+                        reader.GetInt32(3)
                 };
 
-            JsonSerializerOptions options =
-                new()
-                {
-                    WriteIndented = true
-                };
+            reader.Close();
 
-            string json =
-                JsonSerializer.Serialize(
-                    state,
-                    options
+            using SqliteCommand recentCommand =
+                connection.CreateCommand();
+
+            recentCommand.CommandText =
+                """
+                SELECT
+                    RoundId,
+                    PlayedUtc,
+                    Damage,
+                    Kills,
+                    Deaths,
+                    Assists,
+                    Survived,
+                    Contributed,
+                    TeamWon,
+                    ObjectivePoints
+                FROM RecentRounds
+                WHERE SteamId = $steamId
+                ORDER BY RoundId DESC
+                LIMIT $window;
+                """;
+
+            recentCommand.Parameters.AddWithValue(
+                "$steamId",
+                SteamIdToInt64(steamId)
+            );
+
+            recentCommand.Parameters.AddWithValue(
+                "$window",
+                RollingWindowRounds
+            );
+
+            using SqliteDataReader recentReader =
+                recentCommand.ExecuteReader();
+
+            List<RoundSnapshot> loadedRounds =
+                new();
+
+            while (recentReader.Read())
+            {
+                loadedRounds.Add(
+                    new RoundSnapshot
+                    {
+                        RoundId =
+                            recentReader.GetInt64(0),
+
+                        PlayedUtc =
+                            recentReader.GetString(1),
+
+                        PendingPersistence =
+                            false,
+
+                        Damage =
+                            recentReader.GetInt32(2),
+
+                        Kills =
+                            recentReader.GetInt32(3),
+
+                        Deaths =
+                            recentReader.GetInt32(4),
+
+                        Assists =
+                            recentReader.GetInt32(5),
+
+                        Survived =
+                            recentReader.GetInt32(6) != 0,
+
+                        Contributed =
+                            recentReader.GetInt32(7) != 0,
+
+                        TeamWon =
+                            recentReader.GetInt32(8) != 0,
+
+                        ObjectivePoints =
+                            recentReader.GetDouble(9)
+                    }
                 );
+            }
 
-            string temp =
-                DataFilePath + ".tmp";
+            loadedRounds.Reverse();
 
-            File.WriteAllText(
-                temp,
-                json
+            player.RecentRounds.AddRange(
+                loadedRounds
             );
 
-            File.Move(
-                temp,
-                DataFilePath,
-                true
-            );
+            return player;
         }
         catch (Exception ex)
         {
             Logger.LogError(
                 ex,
-                "[WarcraftBalance] Failed to save persistent data."
+                "[WarcraftBalance] Failed to lazy-load SteamID {SteamId} from SQLite.",
+                steamId
+            );
+
+            return null;
+        }
+    }
+
+    private int LoadRoundNumber()
+    {
+        string? value =
+            GetMetadataValue(
+                "RoundNumber"
+            );
+
+        return int.TryParse(
+            value,
+            out int roundNumber)
+                ? roundNumber
+                : 0;
+    }
+
+    private string? GetMetadataValue(
+        string key)
+    {
+        SqliteConnection connection =
+            RequireDatabaseConnection();
+
+        using SqliteCommand command =
+            connection.CreateCommand();
+
+        command.CommandText =
+            """
+            SELECT Value
+            FROM Metadata
+            WHERE Key = $key;
+            """;
+
+        command.Parameters.AddWithValue(
+            "$key",
+            key
+        );
+
+        return command.ExecuteScalar()
+            as string;
+    }
+
+    private void SetMetadataValue(
+        string key,
+        string value,
+        SqliteTransaction transaction)
+    {
+        SqliteConnection connection =
+            RequireDatabaseConnection();
+
+        using SqliteCommand command =
+            connection.CreateCommand();
+
+        command.Transaction =
+            transaction;
+
+        command.CommandText =
+            """
+            INSERT INTO Metadata (
+                Key,
+                Value
+            )
+            VALUES (
+                $key,
+                $value
+            )
+            ON CONFLICT(Key)
+            DO UPDATE SET
+                Value = excluded.Value;
+            """;
+
+        command.Parameters.AddWithValue(
+            "$key",
+            key
+        );
+
+        command.Parameters.AddWithValue(
+            "$value",
+            value
+        );
+
+        command.ExecuteNonQuery();
+    }
+
+    private void SavePersistentData()
+    {
+        if (_databaseConnection == null)
+            return;
+
+        List<RoundSnapshot> pendingSnapshots =
+            _players.Values
+                .SelectMany(
+                    player =>
+                        player.RecentRounds)
+                .Where(
+                    round =>
+                        round.PendingPersistence)
+                .ToList();
+
+        try
+        {
+            SqliteConnection connection =
+                RequireDatabaseConnection();
+
+            using SqliteTransaction transaction =
+                connection.BeginTransaction();
+
+            SetMetadataValue(
+                "RoundNumber",
+                _roundNumber.ToString(),
+                transaction
+            );
+
+            // _players contains only players currently needed in memory.
+            // This stays small even when the database contains hundreds
+            // of thousands of historical SteamIDs.
+            foreach (PlayerBalanceData player
+                     in _players.Values)
+            {
+                SavePlayerData(
+                    player,
+                    transaction
+                );
+            }
+
+            // Race count is tiny compared with player history, so keeping
+            // the full race table in RAM and batch-upserting it is cheap.
+            foreach (RacePerformanceData race
+                     in _raceStats.Values)
+            {
+                SaveRaceData(
+                    race,
+                    transaction
+                );
+            }
+
+            transaction.Commit();
+
+            foreach (RoundSnapshot snapshot
+                     in pendingSnapshots)
+            {
+                snapshot.PendingPersistence =
+                    false;
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(
+                ex,
+                "[WarcraftBalance] Failed to save SQLite persistent data."
             );
         }
+    }
+
+    private void SaveSinglePlayerData(
+        PlayerBalanceData player)
+    {
+        if (_databaseConnection == null)
+            return;
+
+        List<RoundSnapshot> pendingSnapshots =
+            player.RecentRounds
+                .Where(
+                    round =>
+                        round.PendingPersistence)
+                .ToList();
+
+        try
+        {
+            SqliteConnection connection =
+                RequireDatabaseConnection();
+
+            using SqliteTransaction transaction =
+                connection.BeginTransaction();
+
+            SavePlayerData(
+                player,
+                transaction
+            );
+
+            transaction.Commit();
+
+            foreach (RoundSnapshot snapshot
+                     in pendingSnapshots)
+            {
+                snapshot.PendingPersistence =
+                    false;
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(
+                ex,
+                "[WarcraftBalance] Failed to persist disconnecting SteamID {SteamId}.",
+                player.SteamId
+            );
+        }
+    }
+
+    private void SavePlayerData(
+        PlayerBalanceData player,
+        SqliteTransaction transaction)
+    {
+        SqliteConnection connection =
+            RequireDatabaseConnection();
+
+        long steamId =
+            SteamIdToInt64(
+                player.SteamId
+            );
+
+        string now =
+            DateTime.UtcNow.ToString(
+                "O"
+            );
+
+        using (SqliteCommand command =
+               connection.CreateCommand())
+        {
+            command.Transaction =
+                transaction;
+
+            command.CommandText =
+                """
+                INSERT INTO Players (
+                    SteamId,
+                    Name,
+                    HistoricalRating,
+                    LifetimeRounds,
+                    LifetimeWins,
+                    CreatedUtc,
+                    LastSeenUtc
+                )
+                VALUES (
+                    $steamId,
+                    $name,
+                    $historicalRating,
+                    $lifetimeRounds,
+                    $lifetimeWins,
+                    $now,
+                    $now
+                )
+                ON CONFLICT(SteamId)
+                DO UPDATE SET
+                    Name = excluded.Name,
+                    HistoricalRating = excluded.HistoricalRating,
+                    LifetimeRounds = excluded.LifetimeRounds,
+                    LifetimeWins = excluded.LifetimeWins,
+                    LastSeenUtc = excluded.LastSeenUtc;
+                """;
+
+            command.Parameters.AddWithValue(
+                "$steamId",
+                steamId
+            );
+
+            command.Parameters.AddWithValue(
+                "$name",
+                player.Name
+            );
+
+            command.Parameters.AddWithValue(
+                "$historicalRating",
+                player.HistoricalRating
+            );
+
+            command.Parameters.AddWithValue(
+                "$lifetimeRounds",
+                player.LifetimeRounds
+            );
+
+            command.Parameters.AddWithValue(
+                "$lifetimeWins",
+                player.LifetimeWins
+            );
+
+            command.Parameters.AddWithValue(
+                "$now",
+                now
+            );
+
+            command.ExecuteNonQuery();
+        }
+
+        // Write ONLY newly completed snapshots. This keeps ordinary
+        // round persistence to one RecentRounds INSERT per active player.
+        foreach (RoundSnapshot round
+                 in player.RecentRounds
+                     .Where(
+                         snapshot =>
+                             snapshot.PendingPersistence))
+        {
+            using SqliteCommand roundCommand =
+                connection.CreateCommand();
+
+            roundCommand.Transaction =
+                transaction;
+
+            roundCommand.CommandText =
+                """
+                INSERT INTO RecentRounds (
+                    SteamId,
+                    RoundId,
+                    PlayedUtc,
+                    Damage,
+                    Kills,
+                    Deaths,
+                    Assists,
+                    Survived,
+                    Contributed,
+                    TeamWon,
+                    ObjectivePoints
+                )
+                VALUES (
+                    $steamId,
+                    $roundId,
+                    $playedUtc,
+                    $damage,
+                    $kills,
+                    $deaths,
+                    $assists,
+                    $survived,
+                    $contributed,
+                    $teamWon,
+                    $objectivePoints
+                )
+                ON CONFLICT(SteamId, RoundId)
+                DO NOTHING;
+                """;
+
+            roundCommand.Parameters.AddWithValue(
+                "$steamId",
+                steamId
+            );
+
+            roundCommand.Parameters.AddWithValue(
+                "$roundId",
+                round.RoundId
+            );
+
+            roundCommand.Parameters.AddWithValue(
+                "$playedUtc",
+                round.PlayedUtc
+            );
+
+            roundCommand.Parameters.AddWithValue(
+                "$damage",
+                round.Damage
+            );
+
+            roundCommand.Parameters.AddWithValue(
+                "$kills",
+                round.Kills
+            );
+
+            roundCommand.Parameters.AddWithValue(
+                "$deaths",
+                round.Deaths
+            );
+
+            roundCommand.Parameters.AddWithValue(
+                "$assists",
+                round.Assists
+            );
+
+            roundCommand.Parameters.AddWithValue(
+                "$survived",
+                round.Survived ? 1 : 0
+            );
+
+            roundCommand.Parameters.AddWithValue(
+                "$contributed",
+                round.Contributed ? 1 : 0
+            );
+
+            roundCommand.Parameters.AddWithValue(
+                "$teamWon",
+                round.TeamWon ? 1 : 0
+            );
+
+            roundCommand.Parameters.AddWithValue(
+                "$objectivePoints",
+                round.ObjectivePoints
+            );
+
+            roundCommand.ExecuteNonQuery();
+        }
+
+        // Recent history remains physically bounded in SQLite too.
+        // With the (SteamId, RoundId DESC) index this touches only this
+        // player's tiny newest-row range.
+        using (SqliteCommand pruneCommand =
+               connection.CreateCommand())
+        {
+            pruneCommand.Transaction =
+                transaction;
+
+            pruneCommand.CommandText =
+                """
+                DELETE FROM RecentRounds
+                WHERE SteamId = $steamId
+                  AND RoundId NOT IN (
+                      SELECT RoundId
+                      FROM RecentRounds
+                      WHERE SteamId = $steamId
+                      ORDER BY RoundId DESC
+                      LIMIT $window
+                  );
+                """;
+
+            pruneCommand.Parameters.AddWithValue(
+                "$steamId",
+                steamId
+            );
+
+            pruneCommand.Parameters.AddWithValue(
+                "$window",
+                RollingWindowRounds
+            );
+
+            pruneCommand.ExecuteNonQuery();
+        }
+    }
+
+    private void SaveRaceData(
+        RacePerformanceData race,
+        SqliteTransaction transaction)
+    {
+        SqliteConnection connection =
+            RequireDatabaseConnection();
+
+        using SqliteCommand command =
+            connection.CreateCommand();
+
+        command.Transaction =
+            transaction;
+
+        command.CommandText =
+            """
+            INSERT INTO RaceStats (
+                RaceName,
+                RoundsPlayed,
+                ActualWins,
+                ExpectedWins,
+                LastCalculatedModifier
+            )
+            VALUES (
+                $raceName,
+                $roundsPlayed,
+                $actualWins,
+                $expectedWins,
+                $lastCalculatedModifier
+            )
+            ON CONFLICT(RaceName)
+            DO UPDATE SET
+                RoundsPlayed = excluded.RoundsPlayed,
+                ActualWins = excluded.ActualWins,
+                ExpectedWins = excluded.ExpectedWins,
+                LastCalculatedModifier = excluded.LastCalculatedModifier;
+            """;
+
+        command.Parameters.AddWithValue(
+            "$raceName",
+            race.RaceName
+        );
+
+        command.Parameters.AddWithValue(
+            "$roundsPlayed",
+            race.RoundsPlayed
+        );
+
+        command.Parameters.AddWithValue(
+            "$actualWins",
+            race.ActualWins
+        );
+
+        command.Parameters.AddWithValue(
+            "$expectedWins",
+            race.ExpectedWins
+        );
+
+        command.Parameters.AddWithValue(
+            "$lastCalculatedModifier",
+            race.LastCalculatedModifier
+        );
+
+        command.ExecuteNonQuery();
+    }
+
+    private SqliteConnection RequireDatabaseConnection()
+    {
+        if (_databaseConnection == null)
+        {
+            throw new InvalidOperationException(
+                "SQLite has not been initialized."
+            );
+        }
+
+        return _databaseConnection;
+    }
+
+    private static long SteamIdToInt64(
+        ulong steamId)
+    {
+        // SteamID64 values fit safely within SQLite's signed 64-bit
+        // INTEGER range. Keep the conversion checked so a malformed
+        // future identifier fails loudly instead of wrapping.
+        return checked(
+            (long)steamId
+        );
     }
 
     // ============================================================
     // DATA CLASSES
     // ============================================================
 
-    public sealed class PersistentState
-    {
-        public int RoundNumber { get; set; }
 
-        public List<PlayerBalanceData> Players {
-            get;
-            set;
-        } = new();
-
-        public List<RacePerformanceData> Races {
-            get;
-            set;
-        } = new();
-    }
 
     public sealed class PlayerBalanceData
     {
@@ -3231,6 +4185,12 @@ public class WarcraftAutoBalancePlugin : BasePlugin
 
     public sealed class RoundSnapshot
     {
+        public long RoundId { get; set; }
+
+        public string PlayedUtc { get; set; } = "";
+
+        public bool PendingPersistence { get; set; }
+
         public int Damage { get; set; }
 
         public int Kills { get; set; }
