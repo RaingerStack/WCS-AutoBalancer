@@ -1,4 +1,4 @@
-# WarcraftAutoBalance v2.14 — Full Implementation Guide
+# WarcraftAutoBalance v2.15 — Full Implementation Guide
 
 ## 1. Purpose
 
@@ -832,7 +832,12 @@ disconnect event
 
 There is no disconnect rebalance timer and no mid-round `SwitchTeam()`.
 
+Both **emergency move selection and move execution** occur only during the next live `round_prestart`. The disconnect event itself only sets a pending flag.
+
 At the next live `round_prestart`:
+
+The prestart handler continues to process emergency balancing even after the one-time initial Round-1 balance has completed; it no longer exits early once `_initialLiveBalanceCompleted` is true.
+
 
 ```text
 read CURRENT humans
