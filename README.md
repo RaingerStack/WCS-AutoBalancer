@@ -1,8 +1,8 @@
-# WarcraftAutoBalance v2.8 — Full Server & Warcraft Mod Implementation Guide
+# WarcraftAutoBalance v2.10 — Full Server & Warcraft Mod Implementation Guide
 
 This guide covers the complete installation, integration, configuration, validation, and operational model for **WarcraftAutoBalance v2.7**.
 
-v2.8 is designed for a Warcraft-style Counter-Strike 2 server where:
+v2.9 is designed for a Warcraft-style Counter-Strike 2 server where:
 
 - races can dramatically change player power;
 - players may change races frequently;
@@ -1245,6 +1245,160 @@ This is appropriate for a single Warcraft server and a normal community-server p
 
 ---
 
+
+# 31A. v2.9 SQLite Persistence Architecture
+
+v2.9 replaces `balance_data.json` as the active persistence backend with
+`balance.db`.
+
+The architecture is intentionally:
+
+```text
+persistent history → SQLite
+active gameplay    → RAM
+```
+
+The plugin does **not** query SQLite on every `player_hurt`, death, assist, or
+objective event. Those hot paths remain dictionary/state updates.
+
+Historical player scale is separated from active server population:
+
+```text
+plugin startup
+→ open SQLite
+→ enable WAL / NORMAL synchronous / foreign keys
+→ load metadata
+→ load all race statistics only
+→ do NOT load every historical player
+
+player first needed
+→ SELECT by SteamID64
+→ SELECT last 12 RecentRounds
+→ active PlayerBalanceData in RAM
+
+player disconnects
+→ save that player's state in one transaction
+→ evict from _players RAM dictionary
+```
+
+Therefore a very large historical player table does not create a matching
+in-memory player population.
+
+## Schema
+
+```sql
+CREATE TABLE Players (
+    SteamId INTEGER PRIMARY KEY,
+    Name TEXT NOT NULL,
+    HistoricalRating REAL NOT NULL DEFAULT 1000,
+    LifetimeRounds INTEGER NOT NULL DEFAULT 0,
+    LifetimeWins INTEGER NOT NULL DEFAULT 0,
+    CreatedUtc TEXT NOT NULL,
+    LastSeenUtc TEXT NOT NULL
+);
+```
+
+The SteamID64 values used by Steam fit inside SQLite's signed 64-bit INTEGER
+range. The code uses a checked conversion to avoid silent overflow.
+
+Recent balance history is normalized into:
+
+```sql
+CREATE TABLE RecentRounds (
+    SteamId INTEGER NOT NULL,
+    Sequence INTEGER NOT NULL,
+    Damage INTEGER NOT NULL,
+    Kills INTEGER NOT NULL,
+    Deaths INTEGER NOT NULL,
+    Assists INTEGER NOT NULL,
+    Survived INTEGER NOT NULL,
+    Contributed INTEGER NOT NULL,
+    TeamWon INTEGER NOT NULL,
+    ObjectivePoints REAL NOT NULL,
+    PRIMARY KEY (SteamId, Sequence),
+    FOREIGN KEY (SteamId)
+        REFERENCES Players(SteamId)
+        ON DELETE CASCADE
+);
+```
+
+Only the rolling `RollingWindowRounds` records are retained by the active model.
+The current default is 12. A player save replaces at most those bounded rows.
+
+Race statistics remain:
+
+```sql
+CREATE TABLE RaceStats (
+    RaceName TEXT PRIMARY KEY COLLATE NOCASE,
+    RoundsPlayed INTEGER NOT NULL DEFAULT 0,
+    ActualWins REAL NOT NULL DEFAULT 0,
+    ExpectedWins REAL NOT NULL DEFAULT 0,
+    LastCalculatedModifier REAL NOT NULL DEFAULT 1.0
+);
+```
+
+Global/plugin state such as RoundNumber and SchemaVersion is stored in `Metadata`.
+
+## WAL
+
+The connection executes:
+
+```sql
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 5000;
+```
+
+WAL is appropriate for this local server database, particularly if a future
+admin/reporting process reads the database while the game server is running.
+
+When WAL is active, `balance.db-wal` and `balance.db-shm` may exist while the
+server is running. They are normal SQLite files.
+
+## Transaction strategy
+
+Every completed round uses one transaction for:
+
+```text
+RoundNumber metadata
+currently resident players
+their bounded RecentRounds
+all race profiles
+```
+
+A disconnecting player also receives one small transaction before being evicted from RAM. Normal balancing still runs every four rounds; persistence and balance cadence are intentionally separate.
+
+The plugin intentionally does not perform disk writes in high-frequency combat
+event handlers.
+
+## Automatic JSON migration
+
+On startup, if legacy `balance_data.json` exists and the new SQLite Players table
+is empty:
+
+```text
+read old JSON
+→ begin transaction
+→ import RoundNumber
+→ import Players
+→ import each player's recent 12-round list
+→ import RaceStats
+→ COMMIT
+```
+
+Only after a successful commit is the JSON renamed:
+
+```text
+balance_data.json.migrated-YYYYMMDD-HHMMSS
+```
+
+If import fails, the transaction rolls back/disposes and the original JSON stays
+in place.
+
+This makes migration recoverable and preserves the existing rating history.
+
+
 # 32. SteamID64 Identity
 
 Persistent player data is keyed by:
@@ -2220,4 +2374,39 @@ survival credit remains false
 race receives long-term outcome attribution
 ```
 
-That is the intended v2.8 implementation model.
+That is the intended v2.9 implementation model.
+
+
+# v2.10 Recent-Round Persistence Optimization
+
+Recent rounds are now permanent, ordered records while they are inside the
+rolling window.
+
+Each snapshot has a durable `RoundId` and `PlayedUtc`. Missing rounds are not
+materialized, so a player with 4 real rounds is evaluated from 4 records rather
+than 4 records plus 8 artificial zero rounds.
+
+Reconnects query the indexed newest rows with `ORDER BY RoundId DESC LIMIT 12`,
+then reverse that tiny result into chronological order in RAM.
+
+The write path uses a runtime `PendingPersistence` flag. Only newly completed
+snapshots are inserted. The flag is cleared only after the containing SQLite
+transaction successfully commits; failed transactions leave data pending for a
+later retry.
+
+This avoids the v2.9 delete-and-rewrite behavior and also avoids attempting 12
+`INSERT ... DO NOTHING` statements per player every round. In the normal case,
+one active player produces exactly one RecentRounds INSERT for one completed
+round.
+
+The SQLite table remains bounded to the rolling window using the composite
+`(SteamId, RoundId DESC)` index and an indexed prune statement.
+
+Cross-session behavior is natural:
+
+```text
+Day 1: 4 rounds → DB has 4
+Day 2: load 4, play 4 → DB has 8
+Day 3: load 8, play 4 → DB has 12
+next round → oldest record pruned, newest 12 remain
+```
