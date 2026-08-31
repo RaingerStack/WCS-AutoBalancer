@@ -16,7 +16,7 @@ using Microsoft.Data.Sqlite;
 public class WarcraftAutoBalancePlugin : BasePlugin
 {
     public override string ModuleName => "Warcraft Auto Balance";
-    public override string ModuleVersion => "2.13.0";
+    public override string ModuleVersion => "2.14.0";
     public override string ModuleAuthor => "YourName";
     public override string ModuleDescription =>
         "Persistent, self-learning team balancing for Warcraft CS2.";
@@ -63,13 +63,11 @@ public class WarcraftAutoBalancePlugin : BasePlugin
 
     // Coalesces multiple disconnect events that occur nearly together.
     // Example: 10v10 -> 10v9 -> 10v8 is handled once as 10v8.
-    private const float DisconnectRebalanceDelaySeconds = 0.50f;
 
     // A physical team-count difference of 2 or more bypasses the
     // normal every-4-round balance cadence and skill threshold.
     private const int EmergencyTeamCountDifference = 2;
 
-    private bool _disconnectRebalancePending;
 
     // Initial live-round balance state.
     //
@@ -77,6 +75,7 @@ public class WarcraftAutoBalancePlugin : BasePlugin
     // in warmup. We wait for the first non-warmup round_prestart, which
     // CS2 emits before the rest of the round-restart actions.
     private bool _initialLiveBalanceCompleted;
+    private bool _emergencyBalancePendingForNextPrestart;
     private bool _warmupEndedObserved;
     private bool _gameRulesWarningLogged;
 
@@ -455,48 +454,29 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         CCSPlayerController? player =
             @event.Userid;
 
-        if (player != null &&
-            player.SteamID != 0 &&
-            _players.TryGetValue(
-                player.SteamID,
-                out PlayerBalanceData? data))
-        {
-            // Flush only this player's bounded persistent state, then
-            // evict it from RAM. Historical population can therefore
-            // grow without keeping every past player resident.
-            SaveSinglePlayerData(data);
+        if (player is null)
+            return HookResult.Continue;
 
-            _players.Remove(
-                player.SteamID);
+        ulong steamId =
+            player.SteamID;
 
-            _playerRaces.Remove(
-                player.SteamID);
+        if (steamId == 0)
+            return HookResult.Continue;
 
-            _currentRound.Remove(
-                player.SteamID);
-        }
+        SaveSinglePlayerData(steamId);
 
-        QueueEmergencyPopulationRebalance();
+        _players.Remove(steamId);
+        _playerRaces.Remove(steamId);
+        _currentRound.Remove(steamId);
+
+        // Never switch an active pawn because of a disconnect.
+        // Recalculate from CURRENT state at the next live round_prestart.
+        _emergencyBalancePendingForNextPrestart = true;
+
         return HookResult.Continue;
     }
 
-    private void QueueEmergencyPopulationRebalance()
-    {
-        // If several players disconnect together, only queue one check.
-        if (_disconnectRebalancePending)
-            return;
 
-        _disconnectRebalancePending = true;
-
-        AddTimer(
-            DisconnectRebalanceDelaySeconds,
-            () =>
-            {
-                _disconnectRebalancePending = false;
-                EvaluateEmergencyPopulationBalance();
-            }
-        );
-    }
 
     // ============================================================
     // MAP / WARMUP / INITIAL LIVE BALANCE
@@ -504,6 +484,7 @@ public class WarcraftAutoBalancePlugin : BasePlugin
 
     private void OnMapStart(string mapName)
     {
+        _emergencyBalancePendingForNextPrestart = false;
         _initialLiveBalanceCompleted = false;
         _warmupEndedObserved = false;
         _gameRulesWarningLogged = false;
@@ -560,6 +541,20 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         _initialLiveBalanceCompleted = true;
 
         ApplyInitialLiveBalance();
+
+        // Disconnect-driven balancing is executed only here, between rounds.
+        // Recalculate from CURRENT population/race/rating state instead of
+        // executing a swap chosen earlier in the live round.
+        if (_emergencyBalancePendingForNextPrestart)
+        {
+            _emergencyBalancePendingForNextPrestart = false;
+
+            EvaluateEmergencyPopulationBalance();
+
+            // Re-check normal team strength immediately after population
+            // correction while still in the safe prestart window.
+            EvaluateTeamBalance();
+        }
 
         return HookResult.Continue;
     }
@@ -2207,7 +2202,6 @@ public class WarcraftAutoBalancePlugin : BasePlugin
 
         // Immediately run the normal rating/58-42 check after the
         // physical population problem is corrected.
-        Server.NextFrame(EvaluateTeamBalance);
     }
 
     private EmergencyMoveCandidate? FindBestEmergencyMove(
