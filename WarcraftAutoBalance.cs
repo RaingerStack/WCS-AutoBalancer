@@ -16,7 +16,7 @@ using Microsoft.Data.Sqlite;
 public class WarcraftAutoBalancePlugin : BasePlugin
 {
     public override string ModuleName => "Warcraft Auto Balance";
-    public override string ModuleVersion => "2.15.0";
+    public override string ModuleVersion => "2.16.0";
     public override string ModuleAuthor => "YourName";
     public override string ModuleDescription =>
         "Persistent, self-learning team balancing for Warcraft CS2.";
@@ -538,6 +538,27 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         }
 
         return HookResult.Continue;
+    }
+
+    private bool IsWarmupActive()
+    {
+        if (TryGetGameRules(out CCSGameRules? rules) &&
+            rules is not null)
+        {
+            return rules.WarmupPeriod;
+        }
+
+        if (!_gameRulesWarningLogged)
+        {
+            _gameRulesWarningLogged = true;
+
+            Logger.LogWarning(
+                "[WarcraftBalance] Game rules unavailable; " +
+                "falling back to event-based warmup tracking."
+            );
+        }
+
+        return !_warmupEndedObserved;
     }
 
     private static bool TryGetGameRules(
