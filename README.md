@@ -1,4 +1,4 @@
-# WarcraftAutoBalance v2.15 — Full Implementation Guide
+# WarcraftAutoBalance v2.16 — Full Implementation Guide
 
 ## 1. Purpose
 
@@ -1285,3 +1285,26 @@ evict player from RAM
 The persistence layer is SQLite-only. The active game loop remains RAM-first,
 bounded, indexed, and designed so historical player growth does not translate
 into proportional gameplay resource usage.
+
+
+---
+
+## v2.16 Warmup Helper and Static Consistency Pass
+
+The missing `IsWarmupActive()` helper has been added. It uses
+`CCSGameRules.WarmupPeriod` when GameRules are available. If GameRules cannot be
+resolved, the plugin logs a warning once and falls back to `_warmupEndedObserved`.
+Before `EventWarmupEnd` has been observed, the fallback treats the server as
+still being in warmup.
+
+The disconnect path remains round-safe: `OnPlayerDisconnect` only persists/evicts
+the player and sets the pending flag. Emergency move selection and execution are
+performed at the next live `round_prestart`.
+
+A broader static pass checked braces/brackets, duplicate exact method signatures,
+underscore-prefixed state fields, stale disconnect timer symbols, prestart control
+flow, warmup helper presence, and obvious manual respawn/slay/suicide/teleport
+calls.
+
+This is a static source review, not a substitute for compiling against the exact
+CounterStrikeSharp and .NET versions used by the server.
