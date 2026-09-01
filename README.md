@@ -1,4 +1,4 @@
-# WarcraftAutoBalance v2.16 — Full Implementation Guide
+# WarcraftAutoBalance v2.17 — Full Implementation Guide
 
 ## 1. Purpose
 
@@ -7,7 +7,7 @@ server. It balances human team strength while accounting for player performance,
 persistent skill, Warcraft race strength, race level, low-population conditions,
 disconnects, bots, and the unusual combat behavior created by Warcraft races.
 
-v2.11 uses SQLite exclusively for persistent data. Active gameplay calculations
+The plugin uses SQLite exclusively for persistent data. Active gameplay calculations
 remain in RAM.
 
 ---
@@ -708,7 +708,7 @@ Final Rating    Effective Power
 ```
 
 The 600-point scale is intentionally softer than the older 300-point scale. The
-v2.12 ADR/K/D changes widened the legitimate player-rating range, so the older
+The widened ADR/K/D normalization the legitimate player-rating range, so the older
 curve would have exaggerated elite ratings into unrealistic 20x, 50x, or 100x
 low-pop power values.
 
@@ -1289,7 +1289,7 @@ into proportional gameplay resource usage.
 
 ---
 
-## v2.16 Warmup Helper and Static Consistency Pass
+## Warmup Helper and Static Consistency
 
 The missing `IsWarmupActive()` helper has been added. It uses
 `CCSGameRules.WarmupPeriod` when GameRules are available. If GameRules cannot be
@@ -1308,3 +1308,34 @@ calls.
 
 This is a static source review, not a substitute for compiling against the exact
 CounterStrikeSharp and .NET versions used by the server.
+
+
+---
+
+## v2.17 Deep Audit Corrections
+
+This revision incorporates a broader logic, lifecycle, persistence, and efficiency audit.
+
+### Correctness fixes
+- Initial live balance is now marked complete after a valid initial partition, so it does not rerun every `round_prestart`.
+- If fewer than two humans are present, initial balance remains armed and retries later.
+- Warmup `round_start`, damage, deaths, objectives, and `round_end` no longer enter live statistics, historical rating, race learning, or persistent round history.
+- Persistent round identity and current-map live-round cadence are now separate:
+  - `PersistentRoundId` is monotonic and used for SQLite row identity.
+  - `_liveMapRoundNumber` resets each map and controls the every-four-live-round balance cadence.
+- Normal scheduled balancing is now deferred from `round_end` to the next live `round_prestart`, matching emergency and initial balance pawn-safety behavior.
+
+### Rating-model cleanup
+- Historical rating ceiling increased from 1600 to 2200 so sustained elite players are not artificially compressed after the wider ADR/K/D normalization.
+- Low-pop documentation/comments now reflect the 600-point scale and 8.0 power cap.
+
+### Persistence cleanup
+- Removed the unused pre-deployment legacy SQLite schema-migration path.
+- Removed database writes that occurred solely because teams were switched; team membership is not persistent balance data and completed-round persistence already occurs at round end.
+
+### Efficiency improvements
+- Normal single-swap search now caches each player's rating once and uses rating sums instead of rebuilding proposed team lists and recalculating all ratings for every candidate pair.
+- Player-count correction uses the same cached-rating/sum approach.
+- High-frequency combat handlers remain SQL-free.
+
+This remains a source-level audit. External CounterStrikeSharp API compatibility still requires compiling against the exact server project.
