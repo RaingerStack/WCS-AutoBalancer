@@ -16,7 +16,7 @@ using Microsoft.Data.Sqlite;
 public class WarcraftAutoBalancePlugin : BasePlugin
 {
     public override string ModuleName => "Warcraft Auto Balance";
-    public override string ModuleVersion => "2.16.0";
+    public override string ModuleVersion => "2.17.0";
     public override string ModuleAuthor => "YourName";
     public override string ModuleDescription =>
         "Persistent, self-learning team balancing for Warcraft CS2.";
@@ -34,6 +34,8 @@ public class WarcraftAutoBalancePlugin : BasePlugin
 
     private const double DefaultHistoricalRating = 1000.0;
     private const double HistoricalLearningRate = 0.05;
+    private const double MinimumHistoricalRating = 600.0;
+    private const double MaximumHistoricalRating = 2200.0;
     private const int MinimumRoundsForRecentStats = 3;
 
     // ============================================================
@@ -145,7 +147,18 @@ public class WarcraftAutoBalancePlugin : BasePlugin
     private readonly Dictionary<string, RacePerformanceData> _raceStats =
         new(StringComparer.OrdinalIgnoreCase);
 
-    private int _roundNumber;
+    // Persistent monotonic ID used only for SQLite round identity/history.
+    private int _persistentRoundId;
+
+    // Live rounds completed on the current map. Controls the every-4-round cadence.
+    private int _liveMapRoundNumber;
+
+    // True only between a verified live round_start and its round_end.
+    private bool _isLiveRound;
+
+    // Normal every-4-round balance is scheduled at round_end and executed
+    // safely during the following live round_prestart.
+    private bool _scheduledBalancePendingForNextPrestart;
 
     // Captured at round start and held constant for the entire round.
     // Disconnects, respawns, temporary summon forms, and pawn resets
@@ -425,21 +438,18 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         CCSPlayerController player)
     {
         string? raceName = null;
-        double levelModifier = 1.0;
 
         if (_playerRaces.TryGetValue(
                 player.SteamID,
                 out RaceAssignment? race))
         {
             raceName = race.RaceName;
-            levelModifier = race.LevelModifier;
         }
 
         return new CurrentRoundData
         {
             TeamAtRoundStart = player.Team,
-            RaceName = raceName,
-            RaceLevelModifier = levelModifier
+            RaceName = raceName
         };
     }
 
@@ -484,6 +494,9 @@ public class WarcraftAutoBalancePlugin : BasePlugin
 
     private void OnMapStart(string mapName)
     {
+        _liveMapRoundNumber = 0;
+        _isLiveRound = false;
+        _scheduledBalancePendingForNextPrestart = false;
         _emergencyBalancePendingForNextPrestart = false;
         _initialLiveBalanceCompleted = false;
         _warmupEndedObserved = false;
@@ -513,27 +526,39 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         if (IsWarmupActive())
             return HookResult.Continue;
 
-        // First live prestart on the map: perform the full initial balance.
-        // Do not return afterward; a disconnect may also have set an
-        // emergency-balance flag before this same prestart.
+        // Keep retrying the initial partition until at least two humans exist
+        // and a valid initial partition has actually been applied.
         if (!_initialLiveBalanceCompleted)
         {
             ApplyInitialLiveBalance();
+
+            if (_initialLiveBalanceCompleted)
+            {
+                // The initial partition already used current population/ratings.
+                // Any disconnect/scheduled flags accumulated during warmup are stale.
+                _emergencyBalancePendingForNextPrestart = false;
+                _scheduledBalancePendingForNextPrestart = false;
+
+                return HookResult.Continue;
+            }
         }
 
-        // All disconnect-driven move selection AND execution happens here,
-        // during the safe prestart window. Nothing in the disconnect path
-        // calls SwitchTeam() during an active/live round.
         if (_emergencyBalancePendingForNextPrestart)
         {
             _emergencyBalancePendingForNextPrestart = false;
+            _scheduledBalancePendingForNextPrestart = false;
 
-            // Recalculate from CURRENT players, teams, races, levels, and
-            // ratings so we never execute a stale move chosen mid-round.
+            // Emergency population correction and the follow-up normal strength
+            // check both happen only in this safe pre-spawn window.
             EvaluateEmergencyPopulationBalance();
+            EvaluateTeamBalance();
 
-            // Re-check normal team strength immediately after the emergency
-            // population correction, still before normal spawning.
+            return HookResult.Continue;
+        }
+
+        if (_scheduledBalancePendingForNextPrestart)
+        {
+            _scheduledBalancePendingForNextPrestart = false;
             EvaluateTeamBalance();
         }
 
@@ -615,6 +640,7 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             LowPopulationHumanThreshold)
         {
             ApplyInitialLowPopulationBalance(humans);
+            _initialLiveBalanceCompleted = true;
             return;
         }
 
@@ -676,7 +702,7 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             botMoves
         );
 
-        SavePersistentData();
+        _initialLiveBalanceCompleted = true;
     }
 
     private void ApplyInitialLowPopulationBalance(
@@ -731,7 +757,6 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             botMoves
         );
 
-        SavePersistentData();
     }
 
     private InitialTeamPartition? FindBestInitialTeamPartition(
@@ -1325,6 +1350,14 @@ public class WarcraftAutoBalancePlugin : BasePlugin
     {
         _currentRound.Clear();
 
+        if (IsWarmupActive())
+        {
+            _isLiveRound = false;
+            return HookResult.Continue;
+        }
+
+        _isLiveRound = true;
+
         foreach (CCSPlayerController player in GetActivePlayers())
         {
             GetPlayerData(player);
@@ -1333,10 +1366,6 @@ public class WarcraftAutoBalancePlugin : BasePlugin
                 CreateCurrentRoundData(player);
         }
 
-        // This really is a PRE-round expectation now. Capture it once
-        // from human controllers and their round-start teams. Later
-        // disconnects, respawns, summon transformations, or pawn resets
-        // cannot alter the expectation used for race learning.
         _roundExpectation =
             CalculatePreRoundExpectation();
 
@@ -1351,6 +1380,9 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         EventPlayerHurt @event,
         GameEventInfo info)
     {
+        if (!_isLiveRound)
+            return HookResult.Continue;
+
         CCSPlayerController? attacker = @event.Attacker;
         CCSPlayerController? victim = @event.Userid;
 
@@ -1385,6 +1417,9 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         EventPlayerDeath @event,
         GameEventInfo info)
     {
+        if (!_isLiveRound)
+            return HookResult.Continue;
+
         CCSPlayerController? victim = @event.Userid;
         CCSPlayerController? attacker = @event.Attacker;
         CCSPlayerController? assister = @event.Assister;
@@ -1433,6 +1468,9 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         EventBombPlanted @event,
         GameEventInfo info)
     {
+        if (!_isLiveRound)
+            return HookResult.Continue;
+
         CCSPlayerController? player = @event.Userid;
 
         if (!IsUsablePlayer(player))
@@ -1447,6 +1485,9 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         EventBombDefused @event,
         GameEventInfo info)
     {
+        if (!_isLiveRound)
+            return HookResult.Continue;
+
         CCSPlayerController? player = @event.Userid;
 
         if (!IsUsablePlayer(player))
@@ -1465,7 +1506,13 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         EventRoundEnd @event,
         GameEventInfo info)
     {
-        _roundNumber++;
+        if (!_isLiveRound)
+            return HookResult.Continue;
+
+        _isLiveRound = false;
+
+        _persistentRoundId++;
+        _liveMapRoundNumber++;
 
         CsTeam winningTeam =
             (CsTeam)@event.Winner;
@@ -1475,15 +1522,14 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             _roundExpectation
         );
 
-        // SQLite persistence is committed once per completed round.
-        // This is deliberately outside all high-frequency combat
-        // handlers and limits hard-crash data loss to the current
-        // unfinished round.
+        // Persist completed live-round data once. No combat handler performs SQL.
         SavePersistentData();
 
-        if (_roundNumber % BalanceEveryRounds == 0)
+        if (_liveMapRoundNumber % BalanceEveryRounds == 0)
         {
-            Server.NextFrame(EvaluateTeamBalance);
+            // Selection and SwitchTeam execution are deferred to the next
+            // live round_prestart for consistent pawn/spawn safety.
+            _scheduledBalancePendingForNextPrestart = true;
         }
 
         return HookResult.Continue;
@@ -1600,7 +1646,7 @@ public class WarcraftAutoBalancePlugin : BasePlugin
 
             RoundSnapshot snapshot = new()
             {
-                RoundId = _roundNumber,
+                RoundId = _persistentRoundId,
                 PlayedUtc = DateTime.UtcNow.ToString("O"),
                 PendingPersistence = true,
                 Damage = round.Damage,
@@ -1677,8 +1723,8 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         player.HistoricalRating =
             Math.Clamp(
                 player.HistoricalRating,
-                600.0,
-                1600.0
+                MinimumHistoricalRating,
+                MaximumHistoricalRating
             );
     }
 
@@ -2200,7 +2246,6 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             logicalT.Count,
             logicalCT.Count);
 
-        SavePersistentData();
 
         // Immediately run the normal rating/58-42 check after the
         // physical population problem is corrected.
@@ -2510,8 +2555,7 @@ public class WarcraftAutoBalancePlugin : BasePlugin
                 botMoves
             );
 
-            SavePersistentData();
-        }
+            }
     }
 
     private LowPopulationPartition? FindBestLowPopulationPartition(
@@ -2523,10 +2567,12 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         // Cache each player's final rating and convert it to nonlinear
         // effective combat power for this balance pass.
         //
-        // Examples with a 300-point scale:
+        // Examples with the current 600-point scale:
         // 1000 rating -> 1.00 power
-        // 1300 rating -> 2.72 power
-        // 1600 rating -> 7.39 power
+        // 1300 rating -> 1.65 power
+        // 1600 rating -> 2.72 power
+        // 2200 rating -> 7.39 power
+        // 2500+ rating -> capped at 8.00 power
         //
         // Race and level modifiers are already included in the final
         // rating before this transformation.
@@ -2796,29 +2842,49 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         List<CCSPlayerController> terrorists,
         List<CCSPlayerController> counterTerrorists)
     {
+        if (terrorists.Count == 0 ||
+            counterTerrorists.Count == 0)
+        {
+            return null;
+        }
+
+        Dictionary<ulong, double> ratings =
+            terrorists
+                .Concat(counterTerrorists)
+                .ToDictionary(
+                    p => p.SteamID,
+                    CalculatePlayerRating);
+
+        double tSum =
+            terrorists.Sum(p => ratings[p.SteamID]);
+
+        double ctSum =
+            counterTerrorists.Sum(p => ratings[p.SteamID]);
+
         SwapCandidate? best = null;
 
         foreach (CCSPlayerController t in terrorists)
         {
+            double tPlayerRating =
+                ratings[t.SteamID];
+
             foreach (CCSPlayerController ct in counterTerrorists)
             {
-                List<CCSPlayerController> proposedT =
-                    terrorists
-                        .Where(x => x != t)
-                        .Append(ct)
-                        .ToList();
+                double ctPlayerRating =
+                    ratings[ct.SteamID];
 
-                List<CCSPlayerController> proposedCT =
-                    counterTerrorists
-                        .Where(x => x != ct)
-                        .Append(t)
-                        .ToList();
+                double tRating =
+                    (tSum - tPlayerRating + ctPlayerRating) /
+                    terrorists.Count;
 
-                double tRating = CalculateTeamRating(proposedT);
-                double ctRating = CalculateTeamRating(proposedCT);
+                double ctRating =
+                    (ctSum - ctPlayerRating + tPlayerRating) /
+                    counterTerrorists.Count;
 
                 double ctChance =
-                    CalculateExpectedWinChance(ctRating, tRating);
+                    CalculateExpectedWinChance(
+                        ctRating,
+                        tRating);
 
                 SwapCandidate candidate =
                     new()
@@ -2829,8 +2895,6 @@ public class WarcraftAutoBalancePlugin : BasePlugin
                         Imbalance = Math.Abs(ctChance - 0.50)
                     };
 
-                // Scan every possible pair and keep the result closest
-                // to 50/50. The 55/45 target does not short-circuit.
                 if (best == null ||
                     candidate.Imbalance < best.Imbalance)
                 {
@@ -2873,7 +2937,6 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             $"\x0B{ctName}\x01"
         );
 
-        SavePersistentData();
     }
 
     // ============================================================
@@ -2886,11 +2949,9 @@ public class WarcraftAutoBalancePlugin : BasePlugin
     {
         List<CCSPlayerController> larger;
         List<CCSPlayerController> smaller;
-
         CsTeam target;
 
-        if (terrorists.Count >
-            counterTerrorists.Count)
+        if (terrorists.Count > counterTerrorists.Count)
         {
             larger = terrorists;
             smaller = counterTerrorists;
@@ -2903,30 +2964,43 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             target = CsTeam.Terrorist;
         }
 
+        Dictionary<ulong, double> ratings =
+            larger
+                .Concat(smaller)
+                .ToDictionary(
+                    p => p.SteamID,
+                    CalculatePlayerRating);
+
+        double largerSum =
+            larger.Sum(p => ratings[p.SteamID]);
+
+        double smallerSum =
+            smaller.Sum(p => ratings[p.SteamID]);
+
         CCSPlayerController? best = null;
-        double bestDifference =
-            double.MaxValue;
+        double bestDifference = double.MaxValue;
 
         foreach (CCSPlayerController player in larger)
         {
-            List<CCSPlayerController> proposedLarge =
-                larger
-                    .Where(x => x != player)
-                    .ToList();
+            double playerRating =
+                ratings[player.SteamID];
 
-            List<CCSPlayerController> proposedSmall =
-                smaller
-                    .Append(player)
-                    .ToList();
+            double proposedLargeRating =
+                larger.Count > 1
+                    ? (largerSum - playerRating) /
+                      (larger.Count - 1)
+                    : 0.0;
+
+            double proposedSmallRating =
+                (smallerSum + playerRating) /
+                (smaller.Count + 1);
 
             double difference =
                 Math.Abs(
-                    CalculateTeamRating(proposedLarge) -
-                    CalculateTeamRating(proposedSmall)
-                );
+                    proposedLargeRating -
+                    proposedSmallRating);
 
-            if (difference <
-                bestDifference)
+            if (difference < bestDifference)
             {
                 bestDifference = difference;
                 best = player;
@@ -2942,8 +3016,6 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             $" \x04[Balance]\x01 " +
             $"\x0B{best.PlayerName}\x01 moved to correct team sizes."
         );
-
-        SavePersistentData();
     }
 
     // ============================================================
@@ -2989,7 +3061,7 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             );
 
         ReplyDiagnostic(command, "====================================");
-        ReplyDiagnostic(command, $"BALANCE DIAGNOSTICS - Round {_roundNumber}");
+        ReplyDiagnostic(command, $"BALANCE DIAGNOSTICS - Live map round {_liveMapRoundNumber} (persistent ID {_persistentRoundId})");
         ReplyDiagnostic(command, $"T Rating: {tRating:F0}");
         ReplyDiagnostic(command, $"CT Rating: {ctRating:F0}");
         ReplyDiagnostic(command, $"Expected: T {1.0 - ctChance:P1} | CT {ctChance:P1}");
@@ -3202,8 +3274,8 @@ public class WarcraftAutoBalancePlugin : BasePlugin
             ConfigureDatabase();
             EnsureDatabaseSchema();
 
-            _roundNumber =
-                LoadRoundNumber();
+            _persistentRoundId =
+                LoadPersistentRoundId();
 
             // Historical players are intentionally NOT loaded globally.
             // They are lazy-loaded by SteamID64 when first needed.
@@ -3314,10 +3386,6 @@ public class WarcraftAutoBalancePlugin : BasePlugin
 
         command.ExecuteNonQuery();
 
-        MigrateRecentRoundsSchemaIfNeeded(
-            transaction
-        );
-
         using (SqliteCommand indexCommand =
                connection.CreateCommand())
         {
@@ -3343,123 +3411,7 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         transaction.Commit();
     }
 
-    private void MigrateRecentRoundsSchemaIfNeeded(
-        SqliteTransaction transaction)
-    {
-        SqliteConnection connection =
-            RequireDatabaseConnection();
 
-        bool hasSequence = false;
-        bool hasRoundId = false;
-        bool hasPlayedUtc = false;
-
-        using (SqliteCommand inspect =
-               connection.CreateCommand())
-        {
-            inspect.Transaction = transaction;
-            inspect.CommandText =
-                "PRAGMA table_info(RecentRounds);";
-
-            using SqliteDataReader reader =
-                inspect.ExecuteReader();
-
-            while (reader.Read())
-            {
-                string column =
-                    reader.GetString(1);
-
-                hasSequence |=
-                    string.Equals(
-                        column,
-                        "Sequence",
-                        StringComparison.OrdinalIgnoreCase);
-
-                hasRoundId |=
-                    string.Equals(
-                        column,
-                        "RoundId",
-                        StringComparison.OrdinalIgnoreCase);
-
-                hasPlayedUtc |=
-                    string.Equals(
-                        column,
-                        "PlayedUtc",
-                        StringComparison.OrdinalIgnoreCase);
-            }
-        }
-
-        if (!hasSequence ||
-            (hasRoundId && hasPlayedUtc))
-        {
-            return;
-        }
-
-        // Upgrade support for the earlier SQLite v2.9 Sequence schema.
-        // Existing chronological order is preserved with negative IDs;
-        // all new live RoundIds are positive and sort newer.
-        using SqliteCommand migrate =
-            connection.CreateCommand();
-
-        migrate.Transaction = transaction;
-        migrate.CommandText =
-            """
-            ALTER TABLE RecentRounds
-            RENAME TO RecentRounds_v1;
-
-            CREATE TABLE RecentRounds (
-                SteamId INTEGER NOT NULL,
-                RoundId INTEGER NOT NULL,
-                PlayedUtc TEXT NOT NULL,
-                Damage INTEGER NOT NULL,
-                Kills INTEGER NOT NULL,
-                Deaths INTEGER NOT NULL,
-                Assists INTEGER NOT NULL,
-                Survived INTEGER NOT NULL,
-                Contributed INTEGER NOT NULL,
-                TeamWon INTEGER NOT NULL,
-                ObjectivePoints REAL NOT NULL,
-                PRIMARY KEY (SteamId, RoundId),
-                FOREIGN KEY (SteamId)
-                    REFERENCES Players(SteamId)
-                    ON DELETE CASCADE
-            );
-
-            INSERT INTO RecentRounds (
-                SteamId,
-                RoundId,
-                PlayedUtc,
-                Damage,
-                Kills,
-                Deaths,
-                Assists,
-                Survived,
-                Contributed,
-                TeamWon,
-                ObjectivePoints
-            )
-            SELECT
-                SteamId,
-                -1000000 + Sequence,
-                '',
-                Damage,
-                Kills,
-                Deaths,
-                Assists,
-                Survived,
-                Contributed,
-                TeamWon,
-                ObjectivePoints
-            FROM RecentRounds_v1;
-
-            DROP TABLE RecentRounds_v1;
-            """;
-
-        migrate.ExecuteNonQuery();
-
-        Logger.LogInformation(
-            "[WarcraftBalance] Migrated RecentRounds schema v1 -> v2."
-        );
-    }
 
 
 
@@ -3688,11 +3640,11 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         }
     }
 
-    private int LoadRoundNumber()
+    private int LoadPersistentRoundId()
     {
         string? value =
             GetMetadataValue(
-                "RoundNumber"
+                "PersistentRoundId"
             );
 
         return int.TryParse(
@@ -3793,8 +3745,8 @@ public class WarcraftAutoBalancePlugin : BasePlugin
                 connection.BeginTransaction();
 
             SetMetadataValue(
-                "RoundNumber",
-                _roundNumber.ToString(),
+                "PersistentRoundId",
+                _persistentRoundId.ToString(),
                 transaction
             );
 
@@ -4279,9 +4231,6 @@ public class WarcraftAutoBalancePlugin : BasePlugin
         public double ObjectivePoints { get; set; }
 
         public string? RaceName { get; set; }
-
-        public double RaceLevelModifier { get; set; } =
-            1.0;
     }
 
     private sealed class RaceAssignment
