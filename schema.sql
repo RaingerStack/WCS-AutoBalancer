@@ -1,4 +1,4 @@
--- WarcraftAutoBalance v2.10 schema reference
+-- WarcraftAutoBalance v2.17 schema reference
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
